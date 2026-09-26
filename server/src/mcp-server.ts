@@ -3,7 +3,7 @@ import { CallToolRequestSchema, ListToolsRequestSchema } from "@modelcontextprot
 import { z } from "zod";
 import { getCdpBridge } from "./cdp-bridge";
 import { McpTaskMemory } from "./mcp-task-memory";
-import { jsonContent, toolError } from "./mcp-responses";
+import { jsonContent, toolError, jsonWithImages, resultWithImages, imageContent } from "./mcp-responses";
 import { AetherMemoryStore } from "./aether-memory-store";
 
 const taskMemory = new McpTaskMemory();
@@ -961,7 +961,7 @@ export function RegisterMcpTools(server: Server, wsServer?: any) {
                     })
                 }];
                 for (const frame of result.frames || []) {
-                    content.push({ type: "image", data: frame, mimeType: "image/jpeg" });
+                    content.push(imageContent(frame, "image/jpeg"));
                 }
                 return { content };
             }
@@ -982,7 +982,7 @@ export function RegisterMcpTools(server: Server, wsServer?: any) {
                     { type: "text", text: `Title: ${result.title}\nURL: ${result.url}` },
                 ];
                 if (result.screenshot) {
-                    content.push({ type: "image", data: result.screenshot, mimeType: "image/jpeg" });
+                    content.push(imageContent(result.screenshot, "image/jpeg"));
                 }
 
                 return { content };
@@ -1132,12 +1132,14 @@ export function RegisterMcpTools(server: Server, wsServer?: any) {
 
             if (name === "execute_script") {
                 const result = await bridge.sendCommand("evaluate", { script: String(a?.script) });
-                return { content: [{ type: "text", text: `Result: ${JSON.stringify(result)}` }] };
+                // Scripts can return binary payloads (e.g. canvas.toDataURL()).
+                return resultWithImages(result, false);
             }
 
             if (name === "cdp_command") {
                 const result = await bridge.sendCommand("cdp_command", { command: a.command, args: a.args || {} });
-                return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
+                // e.g. Page.captureScreenshot returns { data: "<base64>" }.
+                return jsonWithImages(result);
             }
 
             if (name === "act") {
@@ -1244,7 +1246,9 @@ export function RegisterMcpTools(server: Server, wsServer?: any) {
                     throw err;
                 }
 
-                return { content: [{ type: "text", text: typeof resultMsg === 'string' ? resultMsg : JSON.stringify(resultMsg) }] };
+                // May be a bare base64 screenshot/PDF string or a structured
+                // payload; resultWithImages lifts binary payloads out of text.
+                return resultWithImages(resultMsg, false);
             }
 
             // ==================== AGENT-CENTRIC APIs ====================
@@ -1257,7 +1261,7 @@ export function RegisterMcpTools(server: Server, wsServer?: any) {
                     timeout: a.timeout,
                     screenshot: a.screenshot === true
                 });
-                return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
+                return jsonWithImages(result);
             }
 
             if (name === "smart_navigate") {
@@ -1268,7 +1272,7 @@ export function RegisterMcpTools(server: Server, wsServer?: any) {
                     screenshot: a.screenshot,
                     timeout: a.timeout
                 });
-                return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
+                return jsonWithImages(result);
             }
 
             if (name === "observe_and_act") {
@@ -1277,7 +1281,7 @@ export function RegisterMcpTools(server: Server, wsServer?: any) {
                     observe: a.observe,
                     returnScreenshot: a.returnScreenshot
                 });
-                return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
+                return jsonWithImages(result);
             }
 
             if (name === "agent_form_fill") {
@@ -1302,7 +1306,7 @@ export function RegisterMcpTools(server: Server, wsServer?: any) {
                     { type: "text", text: `Title: ${result.title}\nURL: ${result.url}` }
                 ];
                 if (result.screenshot) {
-                    content.push({ type: "image", data: result.screenshot, mimeType: "image/jpeg" });
+                    content.push(imageContent(result.screenshot, "image/jpeg"));
                 }
                 if (result.elements) {
                     content.push({ type: "text", text: `\nInteractive Elements: ${JSON.stringify(result.elements, null, 2)}` });

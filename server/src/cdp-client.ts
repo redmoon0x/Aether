@@ -30,6 +30,19 @@ interface WaitForSelectorOptions {
 
 type BrowserName = 'chrome' | 'edge' | 'brave' | 'firefox';
 
+/** Default per-command CDP timeout. Generous: navigation and CAPTCHA waits need it. */
+export const CDP_COMMAND_TIMEOUT_MS = 30000;
+
+/**
+ * Timeout for commands issued from a polling loop. Polls re-issue every ~150ms,
+ * so a hung command must fail fast or it stalls the whole loop for 30s.
+ */
+export const CDP_POLL_TIMEOUT_MS = 8000;
+
+const RECONNECT_BASE_DELAY_MS = 2000;
+const RECONNECT_MAX_DELAY_MS = 30000;
+const RECONNECT_MAX_ATTEMPTS = 6;
+
 export interface BrowserProfile {
     browser: BrowserName;
     id: string;
@@ -49,6 +62,8 @@ export class CdpClient {
     private eventListeners = new Map<string, ((params: any) => void)[]>();
     private connected = false;
     private reconnectTimer: NodeJS.Timeout | null = null;
+    private reconnectAttempts = 0;
+    private reconnectGaveUp = false;
     private intentionalClose = false;
     private networkTraffic: any[] = [];
     private consoleLogs: any[] = [];
@@ -220,6 +235,11 @@ export class CdpClient {
                 this.connected = true;
                 this.activeTarget = target;
                 this.documentNodeId = null;
+                if (this.reconnectAttempts > 0) {
+                    console.error(`[CDP] Reconnected after ${this.reconnectAttempts} attempt(s).`);
+                }
+                this.reconnectAttempts = 0;
+                this.reconnectGaveUp = false;
                 console.error(`[CDP] Connected to target: ${target.title} (${target.url})`);
                 try {
                     // Enable minimal CDP domains on connect. Everything else is
@@ -282,10 +302,20 @@ export class CdpClient {
     }
 
     /**
-     * Send a CDP command
+     * Send a CDP command.
+     *
+     * @param timeoutMs Per-call override. Pass {@link CDP_POLL_TIMEOUT_MS} from
+     *   polling loops so a hung command cannot stall the loop for the full
+     *   default. Defaults to {@link CDP_COMMAND_TIMEOUT_MS}.
      */
-    async sendCommand(method: string, params: any = {}): Promise<any> {
+    async sendCommand(method: string, params: any = {}, timeoutMs: number = CDP_COMMAND_TIMEOUT_MS): Promise<any> {
         if (!this.ws || this.ws.readyState !== WebSocket.OPEN) {
+            if (this.reconnectGaveUp) {
+                throw new Error(
+                    `CDP not connected: browser disconnected and could not be re-attached after ` +
+                    `${RECONNECT_MAX_ATTEMPTS} attempts. Call connect_browser or launch_browser to reattach.`
+                );
+            }
             throw new Error("CDP not connected. Call connect() or launch() first.");
         }
 
@@ -293,8 +323,8 @@ export class CdpClient {
         return new Promise((resolve, reject) => {
             const timeout = setTimeout(() => {
                 this.pending.delete(id);
-                reject(new Error(`CDP command '${method}' timed out after 30s`));
-            }, 30000);
+                reject(new Error(`CDP command '${method}' timed out after ${Math.round(timeoutMs / 1000)}s`));
+            }, timeoutMs);
 
             this.pending.set(id, { resolve, reject, timeout });
 
@@ -777,12 +807,12 @@ export class CdpClient {
     /**
      * Evaluate JavaScript in page context
      */
-    async evaluate(expression: string): Promise<any> {
+    async evaluate(expression: string, timeoutMs: number = CDP_COMMAND_TIMEOUT_MS): Promise<any> {
         const result = await this.sendCommand("Runtime.evaluate", {
             expression,
             returnByValue: true,
             awaitPromise: true,
-        });
+        }, timeoutMs);
         return result.result?.value !== undefined ? result.result.value : result.result;
     }
 
@@ -1351,13 +1381,34 @@ async takeHeapSnapshot(reportProgress?: boolean, treatGlobalObjectsAsRoots?: boo
 
     private scheduleReconnect(): void {
         if (this.reconnectTimer) return;
+
+        if (this.reconnectAttempts >= RECONNECT_MAX_ATTEMPTS) {
+            if (!this.reconnectGaveUp) {
+                this.reconnectGaveUp = true;
+                console.error(
+                    `[CDP] Giving up: could not re-attach after ${RECONNECT_MAX_ATTEMPTS} attempts ` +
+                    `(last target: ${this.activeTarget?.url ?? "unknown"}). ` +
+                    `Call connect_browser or launch_browser to reattach.`
+                );
+            }
+            return;
+        }
+
+        const delay = Math.min(
+            RECONNECT_BASE_DELAY_MS * Math.pow(2, this.reconnectAttempts),
+            RECONNECT_MAX_DELAY_MS
+        );
+        this.reconnectAttempts++;
+
         this.reconnectTimer = setTimeout(() => {
             this.reconnectTimer = null;
-            if (this.activeTarget) {
-                console.error("[CDP] Attempting to reconnect...");
-                this.attachToTarget(this.activeTarget).catch(() => {});
-            }
-        }, 2000);
+            if (!this.activeTarget) return;
+            console.error(
+                `[CDP] Reconnect attempt ${this.reconnectAttempts}/${RECONNECT_MAX_ATTEMPTS} ` +
+                `in ${Math.round(delay / 1000)}s...`
+            );
+            this.attachToTarget(this.activeTarget).catch(() => {});
+        }, delay);
     }
 
     private async waitForChrome(port: number, timeoutMs: number = 10000): Promise<void> {
@@ -1704,6 +1755,8 @@ async takeHeapSnapshot(reportProgress?: boolean, treatGlobalObjectsAsRoots?: boo
             clearTimeout(this.reconnectTimer);
             this.reconnectTimer = null;
         }
+        this.reconnectAttempts = 0;
+        this.reconnectGaveUp = false;
         if (this.ws) {
             this.intentionalClose = true;
             this.ws.close();

@@ -10,6 +10,7 @@ import { CdpClient } from '../cdp-client';
 import { LocatorEngine, LocatorCandidate } from '../locator-engine';
 import { PageSnapshotCache } from '../page-snapshot-cache';
 import { Logger } from '../logger';
+import { ActionabilityError, retryAsync } from '../retry';
 import * as Eval from '../eval-scripts';
 
 // ─── Action Facts Helpers ─────────────────────────────────────────────────
@@ -42,6 +43,133 @@ export function diffActionFacts(before: any, after: any): any {
             before?.target?.selectedIndex !== after?.target?.selectedIndex,
         visibleErrors: after?.visibleErrors || [],
     };
+}
+
+// ─── Postconditions ───────────────────────────────────────────────────────
+
+export interface PostconditionReport {
+    /** At least one observable effect was detected. */
+    changed: boolean;
+    /** Names of the signals that fired, for diagnostics. */
+    signals: string[];
+    /** Visible validation/alert text present after the action. */
+    visibleErrors: string[];
+    /** The acted-on element is no longer in the DOM. */
+    targetLost: boolean;
+    /**
+     * Safe to retry the action once with a freshly resolved locator. Only set
+     * when the target vanished with no other effect, which is the signature of
+     * a click that landed on a node React replaced mid-dispatch.
+     */
+    shouldRetry: boolean;
+    /** Operator-facing note about how much to trust the reported success. */
+    note?: string;
+}
+
+/**
+ * Decide whether an action actually took effect, using the facts captured
+ * before and after it.
+ *
+ * Deliberately conservative about retrying. "Nothing observable changed" is the
+ * *normal* outcome for a large class of legitimate interactions — expanding a
+ * comment, opening a dropdown, focusing a field, toggling local UI state — and
+ * blindly re-dispatching those would double-execute the action, which on a
+ * posting flow means two submits. So the only automatic retry is the narrow
+ * case where the target element disappeared from the DOM with no other effect,
+ * which points at a stale node rather than an inert one. Everything else is
+ * reported as inconclusive so the caller can decide.
+ */
+/**
+ * Stable identity for a described element. `describe()` returns a fresh object
+ * every capture, so reference equality would report a change on every call.
+ */
+function elementSignature(el: any): string {
+    if (!el) return '';
+    return [el.tag, el.id, el.name, el.type, el.role].filter(Boolean).join('|');
+}
+
+export function assessActionOutcome(before: any, after: any): PostconditionReport {
+    const facts = diffActionFacts(before, after);
+    const signals: string[] = [];
+
+    if (facts.urlChanged) signals.push('url');
+    if (facts.titleChanged) signals.push('title');
+    if (facts.valueChanged) signals.push('value');
+    if (facts.checkedChanged) signals.push('checked');
+    if (facts.selectedIndexChanged) signals.push('selectedIndex');
+
+    const focusBefore = elementSignature(before?.focused);
+    const focusAfter = elementSignature(after?.focused);
+    if (focusBefore !== focusAfter) signals.push('focus');
+
+    const visibleErrors: string[] = Array.isArray(facts.visibleErrors) ? facts.visibleErrors : [];
+
+    // Without a baseline we cannot distinguish "changed" from "never had a
+    // value", so report inconclusive rather than guessing. Retrying here would
+    // be the dangerous branch, so it stays off.
+    const hasBaseline = !!(before && (before.url !== undefined || before.target || before.focused));
+    // A successful capture always carries a url; its absence means the read
+    // failed. Treating that as "the target vanished" would retry on every
+    // action taken while the page is mid-navigation.
+    const afterCaptured = !!(after && after.url !== undefined);
+
+    if (!hasBaseline || !afterCaptured) {
+        return {
+            changed: false,
+            signals: [],
+            visibleErrors,
+            targetLost: false,
+            shouldRetry: false,
+            note: visibleErrors.length > 0
+                ? `The page is showing ${visibleErrors.length} visible error/alert message(s): ` +
+                  `${visibleErrors.map((e) => `"${String(e).slice(0, 120)}"`).join('; ')}.`
+                : 'Could not capture page state around this action, so its effect is unverified.',
+        };
+    }
+
+    const targetLost = !!(before?.target && !after?.target);
+    const changed = signals.length > 0;
+
+    // A vanished target is only evidence of a stale node if nothing else moved.
+    const shouldRetry = targetLost && !changed;
+
+    let note: string | undefined;
+    if (visibleErrors.length > 0) {
+        note =
+            `The page is showing ${visibleErrors.length} visible error/alert message(s) after this ` +
+            `action: ${visibleErrors.map((e) => `"${String(e).slice(0, 120)}"`).join('; ')}. ` +
+            `The action may have been rejected.`;
+    } else if (shouldRetry) {
+        note =
+            'The element this action targeted is no longer in the DOM and nothing else on the page ' +
+            'changed, which usually means the page re-rendered mid-dispatch. Retrying once with a ' +
+            'freshly resolved element.';
+    } else if (!changed) {
+        note =
+            'No observable page change was detected. This can be normal for in-place UI toggles, ' +
+            'but verify the action took effect before relying on it.';
+    }
+
+    return { changed, signals, visibleErrors, targetLost, shouldRetry, note };
+}
+
+/**
+ * Capture action facts, run `act`, then capture again and assess the outcome.
+ *
+ * Used to make "the click reported success but did nothing" detectable instead
+ * of silently passing through to the caller.
+ */
+export async function withPostcondition<T>(
+    client: CdpClient,
+    selector: string | undefined,
+    act: () => Promise<T>,
+    settleMs: number = 250
+): Promise<{ result: T; report: PostconditionReport }> {
+    const before = await captureActionFacts(client, selector);
+    const result = await act();
+    if (settleMs > 0) await new Promise((r) => setTimeout(r, settleMs));
+    const after = await captureActionFacts(client, selector);
+    return { result, report: assessActionOutcome(before, after) };
 }
 
 // ─── Resolve Actionable Point ─────────────────────────────────────────────
@@ -169,6 +297,10 @@ export async function clickElement(
 /**
  * Click an element by CSS selector — fast path. Gets element center via CDP
  * DOM.getBoxModel and clicks directly. No obscurity/polling/actionability gate.
+ *
+ * `getElementCenter` returns null when the node is missing from the box model,
+ * which on a live page usually means a transient re-render rather than a dead
+ * end. Those get a bounded retry that re-waits for the element to settle.
  */
 export async function clickElementBySelector(
     client: CdpClient,
@@ -189,10 +321,26 @@ export async function clickElementBySelector(
         return 'Clicked element by point';
     }
 
-    const center = await client.getElementCenter(selector);
-    if (!center) throw new Error(`Element not found or not visible: ${selector}`);
+    await retryAsync(
+        async (attempt) => {
+            // On a retry, give the page a chance to finish the re-render that
+            // invalidated the box model before re-reading geometry.
+            if (attempt > 1) {
+                await client
+                    .waitForSelector(selector, 1000, { visible: true, stable: true })
+                    .catch(() => false);
+            }
+            const center = await client.getElementCenter(selector);
+            if (!center)
+                throw new ActionabilityError(
+                    `Element not found or not visible: ${selector}`,
+                    'not_visible'
+                );
+            await client.click(center.x, center.y, params.button, center.width);
+        },
+        { label: `click ${selector}` }
+    );
 
-    await client.click(center.x, center.y, params.button, center.width);
     snapshotCache.invalidate('click_element_by_selector');
     return 'Clicked element by selector';
 }
@@ -262,17 +410,37 @@ export async function fillInput(
 
     if (selector) {
         logger.debug('fillInput: waiting for selector', { selector });
-        await client.waitForSelector(selector);
-        await client.moveMouseToSelector(selector).catch(() => {});
 
-        // Focus via native CDP
-        const nodeId = await client.querySelectorNodeId(selector).catch(() => null);
-        if (nodeId) {
-            await client.focusNode(nodeId).catch(() => {});
-        }
-        // Clear value + dispatch events
-        await client.evaluate(
-            `(function(){var el=document.querySelector(${JSON.stringify(selector)});if(el){el.value='';el.dispatchEvent(new Event('input',{bubbles:true}));el.dispatchEvent(new Event('change',{bubbles:true}));return true;}return false;})()`
+        // waitForSelector reports failure by returning false rather than
+        // throwing, so an unchecked result here means we type into whatever
+        // currently holds focus. Make it an explicit, retryable failure.
+        await retryAsync(
+            async () => {
+                const ready = await client.waitForSelector(selector);
+                if (!ready)
+                    throw new ActionabilityError(
+                        `Element not found or not visible: ${selector}`,
+                        'not_found'
+                    );
+
+                await client.moveMouseToSelector(selector).catch(() => {});
+
+                // Focus via native CDP
+                const nodeId = await client.querySelectorNodeId(selector).catch(() => null);
+                if (nodeId) {
+                    await client.focusNode(nodeId).catch(() => {});
+                }
+                // Clear value + dispatch events
+                const cleared = await client.evaluate(
+                    `(function(){var el=document.querySelector(${JSON.stringify(selector)});if(el){el.value='';el.dispatchEvent(new Event('input',{bubbles:true}));el.dispatchEvent(new Event('change',{bubbles:true}));return true;}return false;})()`
+                );
+                if (cleared === false)
+                    throw new ActionabilityError(
+                        `Element disappeared before it could be filled: ${selector}`,
+                        'not_found'
+                    );
+            },
+            { label: `fill ${selector}` }
         );
     }
 
@@ -393,13 +561,26 @@ export async function setChecked(
     const selector = params.selector;
     if (!selector) throw new Error('Selector required for checked state');
 
-    await client.waitForSelector(selector);
-
-    const before = await client.evaluate(
-        Eval.makeCheckedStateScript(selector)
+    // Unchecked waitForSelector would fall through to the JS fallback and
+    // "succeed" against a missing element. Make absence an explicit failure.
+    const before = await retryAsync(
+        async () => {
+            const ready = await client.waitForSelector(selector);
+            if (!ready)
+                throw new ActionabilityError(
+                    `Element not found or not visible: ${selector}`,
+                    'not_found'
+                );
+            const state = await client.evaluate(Eval.makeCheckedStateScript(selector));
+            if (!state?.success)
+                throw new ActionabilityError(
+                    state?.error || 'Failed to inspect checked state',
+                    'not_found'
+                );
+            return state;
+        },
+        { label: `inspect ${selector}` }
     );
-    if (!before?.success)
-        throw new Error(before?.error || 'Failed to inspect checked state');
 
     const wanted = !!params.checked;
     if (before.checked === wanted)

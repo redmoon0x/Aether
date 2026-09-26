@@ -516,30 +516,87 @@ export class CdpBridge {
         const selector = resolved.selector;
         const candidate = resolved.candidate;
 
-        if (intent === "click") {
-            await Interaction.clickResolvedLocator(this.client, this.locator, this.snapshotCache, candidate);
-        } else if (intent === "fill") {
-            if (candidate?.scope === "document" && candidate.framePath.length === 0 && candidate.shadowDepth === 0 && selector) {
-                await Interaction.fillBySelector(this.client, this.locator, this.snapshotCache, {
-                    selector: selector!,
-                    value: params.value ?? "",
-                    timeout,
-                }, this.logger);
+        // Dispatch the requested intent against a given candidate. Extracted so
+        // the postcondition retry below can re-run it against a fresh locator.
+        const dispatch = async (
+            cand: typeof candidate,
+            sel: string | undefined
+        ): Promise<void> => {
+            if (intent === "click") {
+                await Interaction.clickResolvedLocator(
+                    this.client, this.locator, this.snapshotCache, cand
+                );
+            } else if (intent === "fill") {
+                if (
+                    cand?.scope === "document" &&
+                    cand.framePath.length === 0 &&
+                    cand.shadowDepth === 0 &&
+                    sel
+                ) {
+                    await Interaction.fillBySelector(
+                        this.client, this.locator, this.snapshotCache, {
+                            selector: sel,
+                            value: params.value ?? "",
+                            timeout,
+                        },
+                        this.logger
+                    );
+                } else {
+                    await this.locator.focusAndClear(cand!);
+                    await this.client.typeText(String(params.value ?? ""));
+                }
+            } else if (intent === "select") {
+                await Interaction.selectOption(
+                    this.client, this.locator, this.snapshotCache, {
+                        selector: sel!,
+                        value: params.value ?? "",
+                    },
+                    this.logger
+                );
+            } else if (intent === "check") {
+                await Interaction.checkElement(
+                    this.client, this.locator, this.snapshotCache, {
+                        selector: sel!,
+                    },
+                    this.logger
+                );
             } else {
-                await this.locator.focusAndClear(candidate!);
-                await this.client.typeText(String(params.value ?? ""));
+                throw new Error(`Unsupported browser intent: ${intent}`);
             }
-        } else if (intent === "select") {
-            await Interaction.selectOption(this.client, this.locator, this.snapshotCache, {
-                selector: selector!,
-                value: params.value ?? "",
-            }, this.logger);
-        } else if (intent === "check") {
-            await Interaction.checkElement(this.client, this.locator, this.snapshotCache, {
-                selector: selector!,
-            }, this.logger);
-        } else {
-            throw new Error(`Unsupported browser intent: ${intent}`);
+        };
+
+        // Capture before/after page facts around the action so a click that
+        // reports success but changed nothing becomes visible to the caller.
+        let effectiveSelector = selector;
+        let { report } = await Interaction.withPostcondition(
+            this.client,
+            selector,
+            () => dispatch(candidate, selector)
+        );
+
+        // Narrow retry: only when the target node vanished with no other effect,
+        // which means we clicked a node the page replaced mid-dispatch. Re-resolve
+        // from the original query rather than reusing the now-stale selector.
+        let retried = false;
+        if (report.shouldRetry) {
+            const retryResolved = await this.locator
+                .resolve({
+                    target: params.target,
+                    role: params.role,
+                    timeout,
+                    includeCandidates: params.includeCandidates,
+                })
+                .catch(() => null);
+
+            if (retryResolved?.success && retryResolved.candidate) {
+                retried = true;
+                effectiveSelector = retryResolved.selector;
+                ({ report } = await Interaction.withPostcondition(
+                    this.client,
+                    effectiveSelector,
+                    () => dispatch(retryResolved.candidate, retryResolved.selector)
+                ));
+            }
         }
 
         let verification: any = undefined;
@@ -556,10 +613,14 @@ export class CdpBridge {
             target: resolved.target,
             matchedBy: resolved.matchedBy,
             confidence: resolved.confidence,
-            selector,
-            ref: resolved.ref || (selector ? `css:${selector}` : undefined),
+            selector: effectiveSelector,
+            ref: resolved.ref || (effectiveSelector ? `css:${effectiveSelector}` : undefined),
             verification,
             candidates: params.includeCandidates ? resolved.candidates : undefined,
+            ambiguous: resolved.ambiguous,
+            retried,
+            postcondition: report,
+            warning: [resolved.ambiguityWarning, report.note].filter(Boolean).join(' ') || undefined,
         };
     }
 
@@ -693,13 +754,14 @@ export class CdpBridge {
             ]);
 
             const facts = Interaction.diffActionFacts(beforeFacts, afterFacts);
-            const changesDetected = facts.urlChanged || facts.titleChanged || facts.valueChanged || facts.checkedChanged || facts.selectedIndexChanged;
+            const report = Interaction.assessActionOutcome(beforeFacts, afterFacts);
+            const changesDetected = report.changed;
 
             return {
                 success: true,
                 before: { facts: beforeFacts, screenshot: beforeScreenshot },
                 after: { facts: afterFacts, screenshot: afterScreenshot },
-                changesDetected, facts,
+                changesDetected, facts, postcondition: report,
                 navigationOccurred: facts.urlChanged,
             };
         } catch (e: any) {
