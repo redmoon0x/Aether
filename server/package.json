@@ -22,7 +22,7 @@
     },
     "keywords": [],
     "author": "",
-    "license": "ISC",
+    "license": "MIT",
     "dependencies": {
         "@modelcontextprotocol/sdk": "^1.29.0",
         "express": "^5.2.1",
