@@ -314,6 +314,10 @@ export class CdpBridge {
 
     async ensureConnected(): Promise<void> {
         if (!this.client.isConnected()) {
+            if (process.env.AETHER_MODE === "extension") {
+                await this.client.connectExtension();
+                return;
+            }
             try {
                 await this.client.connect(9222);
             } catch {
@@ -331,6 +335,11 @@ export class CdpBridge {
         userDataDir?: string;
     }): Promise<string> {
         return Session.launchBrowser(this.client, options);
+    }
+
+    async connectExtension(): Promise<string> {
+        await this.client.connectExtension();
+        return "Connected to the Aether-managed browser tab";
     }
 
     async killBrowser(): Promise<string> {

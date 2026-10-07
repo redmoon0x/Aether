@@ -8,6 +8,7 @@ import { RegisterMcpTools } from "./mcp-server";
 import { getCdpClient } from "./cdp-client";
 import { createLogger } from "./logger";
 import { SimpleOAuthProvider } from "./simple-oauth-provider";
+import { StartWebSocketServer } from "./ws-server";
 
 const log = createLogger("index");
 
@@ -17,6 +18,7 @@ const TRANSPORT: "stdio" | "http" =
     (process.argv.includes("--transport=http") ? "http" : "stdio");
 
 const HTTP_PORT = parseInt(process.env.MCP_HTTP_PORT || "3456", 10);
+const EXTENSION_PORT = parseInt(process.env.AETHER_EXTENSION_PORT || "8766", 10);
 
 // ── Graceful shutdown ─────────────────────────────────────────────────
 async function shutdown() {
@@ -125,8 +127,14 @@ async function runStreamableHttp(mcpServer: Server): Promise<void> {
 
 // ── Main ──────────────────────────────────────────────────────────────
 async function main() {
-    log.info("Starting Aether MCP Browser Server (CDP mode)");
+    const browserMode = process.env.AETHER_MODE === "extension" ? "extension" : "CDP";
+    log.info(`Starting Aether MCP Browser Server (${browserMode} mode)`);
     log.info(`Transport: ${TRANSPORT.toUpperCase()}`);
+
+    if (browserMode === "extension") {
+        StartWebSocketServer(EXTENSION_PORT);
+        log.info(`Aether Browser Bridge listening on ws://127.0.0.1:${EXTENSION_PORT}`);
+    }
 
     const server = createMcpServer();
 

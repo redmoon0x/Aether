@@ -1,6 +1,6 @@
 {
     "name": "aether-mcp-server",
-    "version": "2.2.0",
+    "version": "2.2.1",
     "description": "Aether MCP Server - AI Browser Controller",
     "main": "dist/index.js",
     "bin": {
@@ -8,6 +8,7 @@
     },
     "files": [
         "dist/",
+        "extension/",
         "!dist/agent.js",
         "!dist/policy-client.js",
         "!dist/trace-recorder.js",

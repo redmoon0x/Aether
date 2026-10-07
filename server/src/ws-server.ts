@@ -4,6 +4,18 @@ import http from "http";
 export let activeConnection: WebSocket | null = null;
 let messageIdCounter = 0;
 const pendingRequests = new Map<number, { resolve: (val: any) => void; reject: (err: any) => void }>();
+const eventListeners = new Set<(method: string, params: any) => void>();
+
+/** True when the local browser extension has an open WebSocket connection. */
+export function isExtensionConnected(): boolean {
+    return activeConnection?.readyState === WebSocket.OPEN;
+}
+
+/** Subscribe to Chrome DevTools events forwarded by the extension. */
+export function onExtensionEvent(listener: (method: string, params: any) => void): () => void {
+    eventListeners.add(listener);
+    return () => eventListeners.delete(listener);
+}
 
 /**
  * Ensure port is available by killing any stale server
@@ -86,6 +98,14 @@ export function StartWebSocketServer(port: number) {
                         resolve(message.result);
                     }
                     pendingRequests.delete(message.id);
+                } else if (message.method === "event" && message.params?.method) {
+                    for (const listener of eventListeners) {
+                        try {
+                            listener(message.params.method, message.params.params ?? {});
+                        } catch (err) {
+                            console.error("[WS] Extension event listener error:", err);
+                        }
+                    }
                 } else if (message.method === "ping") {
                     // Heartbeat — ignore
                 }

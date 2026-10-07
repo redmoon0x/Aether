@@ -8,6 +8,7 @@ import os from "os";
 import { STEALTH_SCRIPT } from "./stealth";
 import { SHARED_DOM_HELPERS } from "./element-collector";
 import { LOCATOR_BOOTSTRAP_SCRIPT } from "./eval-scripts";
+import { isExtensionConnected, onExtensionEvent, sendCommandToExtension } from "./ws-server";
 
 interface CdpTarget {
     id: string;
@@ -61,6 +62,9 @@ export class CdpClient {
     private activeTarget: CdpTarget | null = null;
     private eventListeners = new Map<string, ((params: any) => void)[]>();
     private connected = false;
+    /** When true, CDP commands are forwarded through the installed Chromium extension. */
+    private extensionMode = false;
+    private removeExtensionEventListener: (() => void) | null = null;
     private reconnectTimer: NodeJS.Timeout | null = null;
     private reconnectAttempts = 0;
     private reconnectGaveUp = false;
@@ -76,6 +80,46 @@ export class CdpClient {
     private documentNodeId: number | null = null;
 
     constructor() {}
+
+    /**
+     * Attach to an Aether-owned tab in an already-running Chromium browser.
+     * The extension creates the tab when necessary and never exposes ordinary
+     * user tabs to the MCP server.
+     */
+    async connectExtension(): Promise<void> {
+        if (!isExtensionConnected()) {
+            throw new Error("No active extension connection. Load the Aether Browser Bridge extension and keep it enabled.");
+        }
+
+        this.extensionMode = true;
+        const target = await sendCommandToExtension("session.attach", {});
+        this.connected = true;
+        this.activeTarget = {
+            id: String(target.id),
+            webSocketDebuggerUrl: "extension://aether",
+            url: target.url || "about:blank",
+            title: target.title || "Aether agent tab",
+            type: "page",
+        };
+        this.documentNodeId = null;
+
+        // Forward browser events so the existing navigation, logging, and
+        // polling helpers continue to behave the same as native CDP mode.
+        if (!this.removeExtensionEventListener) {
+            this.removeExtensionEventListener = onExtensionEvent((method, params) => this.emitEvent(method, params));
+        }
+
+        await this.sendCommand("Runtime.enable").catch(() => {});
+        await this.sendCommand("Page.addScriptToEvaluateOnNewDocument", {
+            source: LOCATOR_BOOTSTRAP_SCRIPT,
+        }).catch(() => {});
+        await this.sendCommand("Page.addScriptToEvaluateOnNewDocument", {
+            source: STEALTH_SCRIPT,
+        }).catch(() => {});
+        this.attachNetworkLogging();
+        this.attachDiagnosticsLogging();
+        console.error(`[CDP] Connected through extension to Aether tab ${target.id}`);
+    }
 
     /** Set speed multiplier. 0 = instant, 1 = normal, 2 = slow (2x delays). */
     setSpeed(m: number): void {
@@ -196,6 +240,17 @@ export class CdpClient {
      * List available CDP targets (tabs/pages)
      */
     async listTargets(port: number = 9222): Promise<CdpTarget[]> {
+        if (this.extensionMode) {
+            const tabs = await sendCommandToExtension("tabs.list", {});
+            this.targets = (tabs || []).map((tab: any) => ({
+                id: String(tab.id),
+                webSocketDebuggerUrl: "extension://aether",
+                url: tab.url || "about:blank",
+                title: tab.title || "Aether agent tab",
+                type: "page",
+            }));
+            return this.targets;
+        }
         return new Promise((resolve, reject) => {
             const req = http.get(`http://localhost:${port}/json`, (res) => {
                 let data = "";
@@ -222,6 +277,17 @@ export class CdpClient {
      * Attach to a specific target/tab
      */
     async attachToTarget(target: CdpTarget): Promise<void> {
+        if (this.extensionMode) {
+            const selected = await sendCommandToExtension("tabs.select", { targetId: target.id });
+            this.connected = true;
+            this.activeTarget = {
+                ...target,
+                url: selected.url || target.url,
+                title: selected.title || target.title,
+            };
+            this.documentNodeId = null;
+            return;
+        }
         if (this.ws) {
             this.intentionalClose = true;
             this.ws.close();
@@ -309,6 +375,13 @@ export class CdpClient {
      *   default. Defaults to {@link CDP_COMMAND_TIMEOUT_MS}.
      */
     async sendCommand(method: string, params: any = {}, timeoutMs: number = CDP_COMMAND_TIMEOUT_MS): Promise<any> {
+        if (this.extensionMode) {
+            if (!isExtensionConnected()) {
+                this.connected = false;
+                throw new Error("Browser extension disconnected. Reopen the Aether Browser Bridge popup and reconnect.");
+            }
+            return this.sendExtensionCommand(method, params);
+        }
         if (!this.ws || this.ws.readyState !== WebSocket.OPEN) {
             if (this.reconnectGaveUp) {
                 throw new Error(
@@ -330,6 +403,37 @@ export class CdpClient {
 
             this.ws!.send(JSON.stringify({ id, method, params }));
         });
+    }
+
+    /** Route target lifecycle commands to the extension's managed-tab boundary. */
+    private async sendExtensionCommand(method: string, params: any): Promise<any> {
+        if (method === "Target.getTargets") {
+            const tabs = await sendCommandToExtension("tabs.list", {});
+            return {
+                targetInfos: (tabs || []).map((tab: any) => ({
+                    targetId: String(tab.id), type: "page", title: tab.title || "",
+                    url: tab.url || "about:blank", attached: String(tab.id) === this.activeTarget?.id,
+                })),
+            };
+        }
+        if (method === "Target.createTarget") {
+            const tab = await sendCommandToExtension("tabs.create", { url: params.url || "about:blank" });
+            return { targetId: String(tab.id) };
+        }
+        if (method === "Target.activateTarget") {
+            const tab = await sendCommandToExtension("tabs.select", { targetId: String(params.targetId) });
+            this.activeTarget = {
+                id: String(tab.id), webSocketDebuggerUrl: "extension://aether", type: "page",
+                url: tab.url || "about:blank", title: tab.title || "Aether agent tab",
+            };
+            this.documentNodeId = null;
+            return {};
+        }
+        if (method === "Target.closeTarget") {
+            await sendCommandToExtension("tabs.close", { targetId: String(params.targetId) });
+            return { success: true };
+        }
+        return sendCommandToExtension("cdp", { method, params });
     }
 
     /**
@@ -1757,6 +1861,12 @@ async takeHeapSnapshot(reportProgress?: boolean, treatGlobalObjectsAsRoots?: boo
         }
         this.reconnectAttempts = 0;
         this.reconnectGaveUp = false;
+        if (this.extensionMode) {
+            await sendCommandToExtension("session.detach", {}).catch(() => {});
+            this.extensionMode = false;
+        }
+        this.removeExtensionEventListener?.();
+        this.removeExtensionEventListener = null;
         if (this.ws) {
             this.intentionalClose = true;
             this.ws.close();
@@ -1771,7 +1881,9 @@ async takeHeapSnapshot(reportProgress?: boolean, treatGlobalObjectsAsRoots?: boo
     }
 
     isConnected(): boolean {
-        return this.connected && this.ws?.readyState === WebSocket.OPEN;
+        return this.extensionMode
+            ? this.connected && isExtensionConnected()
+            : this.connected && this.ws?.readyState === WebSocket.OPEN;
     }
 
     getActiveTarget(): CdpTarget | null {

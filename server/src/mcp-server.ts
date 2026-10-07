@@ -483,11 +483,11 @@ const Tools = [
     },
     {
         name: "connect_browser",
-        description: "Connect to browser. Auto-detects and launches available browser if not connected.",
+        description: "Connect to a browser. Use mode=extension to control a dedicated Aether tab in an already-running browser through the Aether Browser Bridge extension.",
         inputSchema: {
             type: "object",
             properties: {
-                mode: { type: "string", enum: ["connect", "launch", "auto", "ask"], description: "Connect to existing, launch new instance, or return selectable launch choices." },
+                mode: { type: "string", enum: ["connect", "launch", "auto", "ask", "extension"], description: "Connect to a CDP port, launch a browser, return choices, or attach to the extension-managed tab." },
                 port: { type: "number", description: "Browser debugging port (default: 9222)." },
                 headless: { type: "boolean", description: "Run in headless mode (only for launch mode)." },
                 browser: { type: "string", enum: ["chrome", "edge", "brave", "firefox"], description: "Browser to use (default: auto-detect, or brave when profile is set)." },
@@ -805,9 +805,16 @@ export function RegisterMcpTools(server: Server, wsServer?: any) {
             }
 
             if (name === "connect_browser") {
-                const mode = a?.mode || "auto";
+                // In extension deployments the safe default is the dedicated
+                // extension-owned tab, even when an agent omits a mode.
+                const mode = a?.mode || (process.env.AETHER_MODE === "extension" ? "extension" : "auto");
                 const port = a?.port || 9222;
                 const browser = a?.browser || ((a?.profile || a?.profileDirectory) ? "brave" : undefined);
+
+                if (mode === "extension") {
+                    const result = await bridge.connectExtension();
+                    return { content: [{ type: "text", text: result }] };
+                }
 
                 if (mode === "ask") {
                     const profiles = await bridge.listBrowserProfiles("brave");
@@ -905,6 +912,10 @@ export function RegisterMcpTools(server: Server, wsServer?: any) {
             }
 
             if (name === "launch_browser") {
+                if (process.env.AETHER_MODE === "extension") {
+                    const result = await bridge.connectExtension();
+                    return { content: [{ type: "text", text: result }] };
+                }
                 const browser = a?.browser || ((a?.profile || a?.profileDirectory) ? "brave" : undefined);
                 const result = await bridge.launchBrowser({ 
                     browser,

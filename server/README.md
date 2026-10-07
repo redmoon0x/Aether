@@ -70,6 +70,20 @@ chrome --remote-debugging-port=9222
 connect_browser(mode="connect", port=9222)
 ```
 
+## Existing browser via extension
+
+To keep Brave/Chrome open and share its signed-in profile, load the repository's
+`extension/` folder from the browser's Extensions page (turn on Developer mode,
+then choose **Load unpacked**). Start the MCP with `AETHER_MODE=extension`, open
+the extension popup, and call:
+
+```
+connect_browser(mode="extension")
+```
+
+The extension opens an Aether-owned tab and only that tab (and any tabs it opens)
+is exposed to the MCP. Your existing tabs are deliberately not controllable.
+
 ## Key Tools
 
 | Tool | What it does |
@@ -92,6 +106,7 @@ Aether stores learned lessons and reusable skills inside your project under `.ae
 | Variable | Purpose |
 |---|---|
 | `AETHER_MODE` | `"cdp"` (default) or `"extension"` |
+| `AETHER_EXTENSION_PORT` | Loopback bridge port for extension mode (default `8766`) |
 | `AETHER_PROJECT_ROOT` | Fallback project root for aether memory |
 
 ## Requirements
