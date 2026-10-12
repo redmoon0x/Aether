@@ -483,11 +483,11 @@ const Tools = [
     },
     {
         name: "connect_browser",
-        description: "Connect to a browser. Use mode=extension to control a dedicated Aether tab in an already-running browser through the Aether Browser Bridge extension.",
+        description: "Connect to a browser over CDP: attach to an existing debugging port, launch a browser, or return choices.",
         inputSchema: {
             type: "object",
             properties: {
-                mode: { type: "string", enum: ["connect", "launch", "auto", "ask", "extension"], description: "Connect to a CDP port, launch a browser, return choices, or attach to the extension-managed tab." },
+                mode: { type: "string", enum: ["connect", "launch", "auto", "ask"], description: "Connect to a CDP port, launch a browser, or return choices." },
                 port: { type: "number", description: "Browser debugging port (default: 9222)." },
                 headless: { type: "boolean", description: "Run in headless mode (only for launch mode)." },
                 browser: { type: "string", enum: ["chrome", "edge", "brave", "firefox"], description: "Browser to use (default: auto-detect, or brave when profile is set)." },
@@ -720,7 +720,7 @@ const Tools = [
     }
 ];
 
-export function RegisterMcpTools(server: Server, wsServer?: any) {
+export function RegisterMcpTools(server: Server) {
     server.setRequestHandler(ListToolsRequestSchema, async () => ({ tools: Tools }));
 
     server.setRequestHandler(CallToolRequestSchema, async (request) => {
@@ -805,16 +805,9 @@ export function RegisterMcpTools(server: Server, wsServer?: any) {
             }
 
             if (name === "connect_browser") {
-                // In extension deployments the safe default is the dedicated
-                // extension-owned tab, even when an agent omits a mode.
-                const mode = a?.mode || (process.env.AETHER_MODE === "extension" ? "extension" : "auto");
+                const mode = a?.mode || "auto";
                 const port = a?.port || 9222;
                 const browser = a?.browser || ((a?.profile || a?.profileDirectory) ? "brave" : undefined);
-
-                if (mode === "extension") {
-                    const result = await bridge.connectExtension();
-                    return { content: [{ type: "text", text: result }] };
-                }
 
                 if (mode === "ask") {
                     const profiles = await bridge.listBrowserProfiles("brave");
@@ -912,10 +905,6 @@ export function RegisterMcpTools(server: Server, wsServer?: any) {
             }
 
             if (name === "launch_browser") {
-                if (process.env.AETHER_MODE === "extension") {
-                    const result = await bridge.connectExtension();
-                    return { content: [{ type: "text", text: result }] };
-                }
                 const browser = a?.browser || ((a?.profile || a?.profileDirectory) ? "brave" : undefined);
                 const result = await bridge.launchBrowser({ 
                     browser,
@@ -1357,7 +1346,7 @@ export function RegisterMcpTools(server: Server, wsServer?: any) {
             if (error.captcha) {
                 return toolError(error);
             }
-            if (error.message?.includes("not connected") || error.message?.includes("No active extension")) {
+            if (error.message?.includes("not connected") || error.message?.includes("CDP not connected")) {
                 return toolError(error);
             }
             return toolError(error);

@@ -14,7 +14,7 @@ export function toolError(error: any): { content: TextPart[]; isError: true } {
     if (error?.captcha) {
         return { content: [{ type: "text", text: JSON.stringify(error.captcha) }], isError: true };
     }
-    if (error?.message?.includes("not connected") || error?.message?.includes("No active extension")) {
+    if (error?.message?.includes("not connected") || error?.message?.includes("CDP not connected")) {
         return { content: [{ type: "text", text: "Browser not connected. Use 'connect_browser' tool first to connect or launch Chrome." }], isError: true };
     }
     return { content: [{ type: "text", text: `Error: ${error?.message || String(error)}` }], isError: true };

@@ -100,28 +100,11 @@ chrome --remote-debugging-port=9222
 connect_browser(mode="connect", port=9222)
 ```
 
-### Use your already-open Brave/Chrome (extension mode)
-
-If you want Aether to reuse the browser profile you are currently using, install
-the included `server/extension/` folder as an unpacked Chromium extension. It creates a
-separate **Aether agent tab** in that same browser; the MCP cannot enumerate or
-control your ordinary tabs.
-
-1. In Brave/Chrome, open `brave://extensions` or `chrome://extensions`, enable
-   **Developer mode**, then choose **Load unpacked** and select this repository's
-   `server/extension` folder.
-2. Start Aether with `AETHER_MODE=extension` (and optionally
-   `AETHER_EXTENSION_PORT=8766`). The extension popup should say it is connected.
-3. Call `connect_browser(mode="extension")`. Aether opens or reuses its own tab,
-   while the rest of your browsing session remains available to you.
-
-The extension stays installed when the MCP is stopped. It automatically retries
-its loopback connection about every 30 seconds after the MCP starts again; using
-the extension popup reconnects it immediately.
-
-The bridge only listens on `127.0.0.1:8766`. Keep the extension installed only
-in profiles you trust, because the browser debugger permission grants it full
-access to its agent tabs.
+Note that the browser must be started with `--remote-debugging-port` for Aether to
+attach to it. A browser started normally, with the profile and logins you already
+have open, cannot be controlled: Chromium offers no supported way to attach to an
+already-running instance. To reuse a signed-in profile, launch a separate browser
+with its own `--user-data-dir` pointing at a dedicated profile directory.
 
 ---
 
