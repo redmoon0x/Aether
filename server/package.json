@@ -13,6 +13,7 @@
         "!dist/agent.js",
         "!dist/policy-client.js",
         "!dist/trace-recorder.js",
+        "!dist/test/",
         "README.md"
     ],
     "scripts": {
