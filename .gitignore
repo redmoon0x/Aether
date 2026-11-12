@@ -12,6 +12,9 @@ server/dist/
 .env.local
 .aether/
 
+# npm auth
+.npmrc
+
 # IDE
 .vscode/
 .idea/
