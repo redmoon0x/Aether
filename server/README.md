@@ -160,6 +160,8 @@ Aether stores learned lessons and reusable skills inside your project under `.ae
 | `AETHER_SESSION_DIR` | Where sessions and the relay token live. Default `~/.aether` |
 | `AETHER_EXTENSION_PORT` | Extension relay port. Default `8766` |
 | `AETHER_EXTENSION_TOKEN` | Token the extension must present. Default: the generated `~/.aether/relay-token` |
+| `AETHER_STEALTH` | Set to `0` to disable page stealth patches (default: on) |
+| `AETHER_FILE_ROOT` | Directory for the `files` helper in `execute`. Default: a temp folder |
 
 ## Requirements
 

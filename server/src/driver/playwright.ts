@@ -8,6 +8,7 @@
 import { chromium, type Browser, type Page } from "patchright-core";
 import { getExtensionRelay, relayToken } from "../extension-relay";
 import { launchedPorts } from "../browser-launch";
+import { STEALTH_SCRIPT, stealthEnabled } from "../stealth";
 import type { BrowserInfo, BrowserTarget, Driver, ResolvedPage, SessionPin } from "./types";
 
 interface CachedBrowser {
@@ -94,7 +95,27 @@ export class PlaywrightDriver implements Driver {
         const endpoint = this.endpointFor(browserId);
         const browser = await chromium.connectOverCDP(endpoint);
         this.browsers.set(browserId, { browser, endpoint });
+        await this.applyStealth(browser);
         return browser;
+    }
+
+    /**
+     * Inject the page-level stealth patches.
+     *
+     * Patchright's launch-time patches do not apply to a browser we attach to
+     * over CDP, so this adds the same mitigations as an init script. The
+     * context script covers future pages; the current document needs one
+     * evaluation because init scripts only run on the next navigation.
+     */
+    private async applyStealth(browser: Browser): Promise<void> {
+        if (!stealthEnabled()) return;
+        for (const context of browser.contexts()) {
+            await context.addInitScript({ content: STEALTH_SCRIPT }).catch(() => undefined);
+            for (const page of context.pages()) {
+                await page.addInitScript({ content: STEALTH_SCRIPT }).catch(() => undefined);
+                await page.evaluate(STEALTH_SCRIPT).catch(() => undefined);
+            }
+        }
     }
 
     // ─── targets ─────────────────────────────────────────────────────
