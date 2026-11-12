@@ -295,7 +295,7 @@ export class AetherMemoryStore {
         const gitRoot = await this.findGitRoot(base);
         const root = gitRoot || base;
         if (!createAllowed && !(await this.exists(this.aetherDir(root)))) {
-            throw new Error(`Aether memory is not configured for ${root}. Call configure_aether_memory with the project root first.`);
+            throw new Error(`Aether memory is not configured for ${root}. Call memory {action:"configure"} with the project root first.`);
         }
         return root;
     }

@@ -1,6 +1,6 @@
 {
     "name": "aether-mcp-server",
-    "version": "2.2.1",
+    "version": "3.0.0",
     "description": "Aether MCP Server - AI Browser Controller",
     "main": "dist/index.js",
     "bin": {
@@ -8,17 +8,26 @@
     },
     "files": [
         "dist/",
+        "skills/",
+        "extension/",
         "!dist/agent.js",
         "!dist/policy-client.js",
         "!dist/trace-recorder.js",
         "README.md"
     ],
     "scripts": {
+        "prebuild": "node -e \"require('fs').rmSync('dist',{recursive:true,force:true})\"",
         "build": "tsc",
         "postbuild": "node -e \"const f=require('fs');const c=f.readFileSync('dist/index.js','utf8');f.writeFileSync('dist/index.js','#!/usr/bin/env node\\n'+c.replace('#!/usr/bin/env node\\n',''))\"",
         "start": "ts-node src/index.ts",
         "dev": "nodemon src/index.ts",
+        "typecheck": "tsc --noEmit",
+        "pretest": "npm run build",
+        "test": "node --test \"dist/test/*.test.js\"",
         "prepublishOnly": "npm run build"
+    },
+    "engines": {
+        "node": ">=20"
     },
     "keywords": [],
     "author": "",
@@ -26,6 +35,7 @@
     "dependencies": {
         "@modelcontextprotocol/sdk": "^1.29.0",
         "express": "^5.2.1",
+        "patchright-core": "^1.64.3",
         "ws": "^8.18.0",
         "zod": "^3.23.8"
     },

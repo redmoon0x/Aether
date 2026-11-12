@@ -5,7 +5,10 @@ import { createMcpExpressApp } from "@modelcontextprotocol/sdk/server/express.js
 import { mcpAuthRouter } from "@modelcontextprotocol/sdk/server/auth/router.js";
 import { requireBearerAuth } from "@modelcontextprotocol/sdk/server/auth/middleware/bearerAuth.js";
 import { RegisterMcpTools } from "./mcp-server";
-import { getCdpClient } from "./cdp-client";
+import { getDriver } from "./driver";
+import { getExtensionRelay } from "./extension-relay";
+import { getHandoffRegistry } from "./handoff";
+import { AETHER_INSTRUCTIONS } from "./instructions";
 import { createLogger } from "./logger";
 import { SimpleOAuthProvider } from "./simple-oauth-provider";
 
@@ -21,11 +24,9 @@ const HTTP_PORT = parseInt(process.env.MCP_HTTP_PORT || "3456", 10);
 // ── Graceful shutdown ─────────────────────────────────────────────────
 async function shutdown() {
     log.info("Shutting down...");
-    const client = getCdpClient();
-    if (client.isConnected()) {
-        log.info("Killing browser...");
-        await client.killBrowser();
-    }
+    getHandoffRegistry().cancelAll("server shutdown");
+    await getDriver().disconnect().catch(() => undefined);
+    await getExtensionRelay().stop().catch(() => undefined);
     process.exit(0);
 }
 
@@ -40,10 +41,8 @@ process.on("unhandledRejection", (reason, promise) => {
     shutdown();
 });
 process.on("exit", () => {
-    const client = getCdpClient();
-    if (client.isConnected()) {
-        client.disconnect();
-    }
+    // Playwright connections are closed by the shutdown handler; nothing
+    // synchronous to do here.
 });
 
 // ── Create MCP Server (shared by both transports) ─────────────────────
@@ -51,12 +50,13 @@ function createMcpServer(): Server {
     const server = new Server(
         {
             name: "aether-mcp-server",
-            version: "2.1.0",
+            version: "3.0.0",
         },
         {
             capabilities: {
                 tools: {},
             },
+            instructions: AETHER_INSTRUCTIONS,
         }
     );
     RegisterMcpTools(server);
@@ -125,8 +125,17 @@ async function runStreamableHttp(mcpServer: Server): Promise<void> {
 
 // ── Main ──────────────────────────────────────────────────────────────
 async function main() {
-    log.info("Starting Aether MCP Browser Server (CDP mode)");
+    log.info("Starting Aether MCP Browser Server (Patchright driver)");
     log.info(`Transport: ${TRANSPORT.toUpperCase()}`);
+
+    // The relay is part of the server: it listens from boot, so a browser can
+    // pair (one click) without a tool call having to start anything first.
+    void getExtensionRelay()
+        .start()
+        .then(({ port, started }) =>
+            log.info(`Extension relay ${started ? "listening" : "already running"} on 127.0.0.1:${port}`)
+        )
+        .catch((error) => log.warn("Extension relay did not start", { error: String(error?.message ?? error) }));
 
     const server = createMcpServer();
 

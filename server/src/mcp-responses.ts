@@ -10,12 +10,47 @@ export function jsonContent(value: unknown, pretty: boolean = false): { content:
     return textContent(JSON.stringify(value, null, pretty ? 2 : 0));
 }
 
+/**
+ * A result with both a readable text block and `structuredContent`.
+ *
+ * Use for tools that declare an `outputSchema`: clients validate the structured
+ * half against it, and everything that only reads text still gets the JSON.
+ */
+export function jsonToolResult(
+    value: unknown,
+    options: { text?: string; isError?: boolean } = {}
+): { content: TextPart[]; structuredContent?: Record<string, unknown>; isError?: boolean } {
+    let text = options.text;
+    if (text === undefined) {
+        try {
+            text = JSON.stringify(value, null, 2) ?? String(value);
+        } catch {
+            text = String(value);
+        }
+    }
+
+    const result: { content: TextPart[]; structuredContent?: Record<string, unknown>; isError?: boolean } = {
+        content: [{ type: "text", text }],
+    };
+    if (value && typeof value === "object" && !Array.isArray(value)) {
+        result.structuredContent = value as Record<string, unknown>;
+    }
+    if (options.isError) result.isError = true;
+    return result;
+}
+
 export function toolError(error: any): { content: TextPart[]; isError: true } {
     if (error?.captcha) {
         return { content: [{ type: "text", text: JSON.stringify(error.captcha) }], isError: true };
     }
     if (error?.message?.includes("not connected") || error?.message?.includes("CDP not connected")) {
-        return { content: [{ type: "text", text: "Browser not connected. Use 'connect_browser' tool first to connect or launch Chrome." }], isError: true };
+        return {
+            content: [{
+                type: "text",
+                text: "Browser not connected. Use the browser tool first: action 'launch' starts one, action 'connect' attaches to a browser started with --remote-debugging-port."
+            }],
+            isError: true
+        };
     }
     return { content: [{ type: "text", text: `Error: ${error?.message || String(error)}` }], isError: true };
 }

@@ -1,0 +1,54 @@
+<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <title>Aether Browser Bridge</title>
+    <style>
+      :root { color-scheme: light dark; }
+      body {
+        width: 320px;
+        margin: 0;
+        padding: 14px;
+        font: 13px/1.45 system-ui, -apple-system, "Segoe UI", sans-serif;
+      }
+      h1 { font-size: 14px; margin: 0 0 4px; }
+      p.status { margin: 0 0 12px; font-size: 12px; opacity: 0.75; }
+      .dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; margin-right: 6px; background: #9ca3af; }
+      .dot.on { background: #22c55e; }
+      label { display: block; margin: 10px 0 4px; font-size: 12px; opacity: 0.8; }
+      input { width: 100%; box-sizing: border-box; padding: 6px 8px; font: inherit; border: 1px solid #d1d5db; border-radius: 6px; }
+      input.code { letter-spacing: 2px; text-transform: uppercase; font-family: ui-monospace, monospace; }
+      .row { display: flex; gap: 8px; margin-top: 12px; }
+      button {
+        flex: 1; padding: 8px 10px; font: inherit; border-radius: 6px;
+        border: 1px solid #d1d5db; background: #f9fafb; cursor: pointer;
+      }
+      button.primary { background: #2563eb; border-color: #2563eb; color: #fff; font-weight: 600; }
+      button:disabled { opacity: 0.5; cursor: default; }
+      .hint { margin: 6px 0 0; font-size: 11px; opacity: 0.65; }
+      #log { margin-top: 12px; font-size: 11px; opacity: 0.75; min-height: 16px; white-space: pre-wrap; }
+    </style>
+  </head>
+  <body>
+    <h1>Aether Browser Bridge</h1>
+    <p class="status"><span id="dot" class="dot"></span><span id="state">checking…</span></p>
+
+    <label for="relayUrl">Relay address</label>
+    <input id="relayUrl" value="ws://127.0.0.1:8766" spellcheck="false" />
+
+    <label for="code">Pairing code</label>
+    <input id="code" class="code" placeholder="ABCD-1234" spellcheck="false" autocomplete="off" />
+    <p class="hint">Aether prints this code in the tool result, like <code>AB12-CD34</code>. It works once.</p>
+
+    <div class="row">
+      <button id="connect" class="primary">Connect</button>
+    </div>
+    <div class="row">
+      <button id="lend">Lend this tab</button>
+      <button id="open">Open agent tab</button>
+    </div>
+
+    <div id="log"></div>
+    <script src="popup.js"></script>
+  </body>
+</html>

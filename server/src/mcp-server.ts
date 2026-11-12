@@ -1,742 +1,784 @@
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { CallToolRequestSchema, ListToolsRequestSchema } from "@modelcontextprotocol/sdk/types.js";
 import { z } from "zod";
-import { getCdpBridge } from "./cdp-bridge";
+import * as path from "path";
+import { getDriver } from "./driver";
+import type { ResolvedPage } from "./driver";
+import {
+    launchBrowserProcess,
+    killLaunchedBrowser,
+    listAvailableBrowsers,
+    listBrowserProfiles,
+} from "./browser-launch";
 import { McpTaskMemory } from "./mcp-task-memory";
-import { jsonContent, toolError, jsonWithImages, resultWithImages, imageContent } from "./mcp-responses";
+import { jsonContent, jsonToolResult, toolError, jsonWithImages } from "./mcp-responses";
 import { AetherMemoryStore } from "./aether-memory-store";
+import { PageHost, getOrCreatePageHost, setActivePageHost, getPageHost } from "./page";
+import { runExecute, ExecuteLogEntry } from "./execute";
+import { getHandoffRegistry, HandoffOutcome } from "./handoff";
+import { getSessionManager, SessionRecord } from "./sessions";
+import { OUTPUT_SCHEMAS, TOOL_ANNOTATIONS } from "./tool-schemas";
+import { MERGED_TOOL_DEFINITIONS } from "./tool-definitions";
+import { getExtensionRelay } from "./extension-relay";
+import { assertCdpAllowed } from "./relay/guardrails";
+import { detectAndSolve } from "./captcha-solver";
+import { getSecretStore } from "./secrets";
 
 const taskMemory = new McpTaskMemory();
 const aetherMemory = new AetherMemoryStore();
 
-const Tools = [
-    {
-        name: "get_task_graph",
-        description: "Retrieve the hierarchical task graph for the current session (Aether v2 Task Orbit).",
-        inputSchema: { type: "object", properties: {} },
-    },
-    {
-        name: "configure_aether_memory",
-        description: "Initialize project-local Aether learning in <project>/.aether and add .aether/ to .gitignore. Use before storing or recalling repo-specific lessons and SKILL.md skills.",
-        inputSchema: {
-            type: "object",
-            properties: {
-                projectRoot: { type: "string", description: "Absolute path to the project/repo root. Defaults to AETHER_PROJECT_ROOT or the MCP process cwd." }
-            }
-        }
-    },
-    {
-        name: "remember_aether_lesson",
-        description: "Store a compact reusable lesson after a complex success, recovered error, user correction, or non-trivial workflow discovery. Stores only distilled issue/solution learning in project-local .aether.",
-        inputSchema: {
-            type: "object",
-            properties: {
-                projectRoot: { type: "string" },
-                title: { type: "string" },
-                trigger: { type: "string", description: "When this lesson should be considered again." },
-                problemPattern: { type: "string", description: "Reusable failure pattern or friction that appeared." },
-                symptoms: { type: "array", items: { type: "string" } },
-                failedApproach: { type: "string" },
-                betterApproach: { type: "string", description: "The reusable better way Aether learned." },
-                createdBecause: {
-                    type: "string",
-                    enum: [
-                        "complex_task_succeeded",
-                        "errors_overcome",
-                        "user_corrected_approach_worked",
-                        "non_trivial_workflow_discovered",
-                        "user_asked_to_remember"
-                    ]
-                },
-                evidence: { type: "string" },
-                tags: { type: "array", items: { type: "string" } },
-                confidence: { type: "number" }
-            },
-            required: ["title", "trigger", "problemPattern", "betterApproach", "createdBecause"]
-        }
-    },
-    {
-        name: "recall_aether_memory",
-        description: "Recall relevant project-local Aether lessons by intent, problem, or tags. Returns compact issue/solution records from .aether only.",
-        inputSchema: {
-            type: "object",
-            properties: {
-                projectRoot: { type: "string" },
-                intent: { type: "string" },
-                problem: { type: "string" },
-                tags: { type: "array", items: { type: "string" } },
-                limit: { type: "number" }
-            }
-        }
-    },
-    {
-        name: "record_aether_lesson_outcome",
-        description: "Update confidence for a stored Aether lesson after it succeeds or fails later.",
-        inputSchema: {
-            type: "object",
-            properties: {
-                projectRoot: { type: "string" },
-                id: { type: "string" },
-                success: { type: "boolean" },
-                evidence: { type: "string" }
-            },
-            required: ["id", "success"]
-        }
-    },
-    {
-        name: "create_aether_skill",
-        description: "Create or replace a project-local Claude-style skill at .aether/skills/<name>/SKILL.md for reusable procedures Aether should apply in this repo.",
-        inputSchema: {
-            type: "object",
-            properties: {
-                projectRoot: { type: "string" },
-                name: { type: "string", description: "Lowercase hyphenated skill name; normalized if needed." },
-                description: { type: "string", description: "Frontmatter description with what the skill does and when to use it." },
-                trigger: { type: "string", description: "Concise body text explaining when to apply the procedure." },
-                procedure: { type: "array", items: { type: "string" } },
-                examples: { type: "array", items: { type: "string" } },
-                edgeCases: { type: "array", items: { type: "string" } },
-                verification: { type: "array", items: { type: "string" } }
-            },
-            required: ["name", "description", "trigger", "procedure"]
-        }
-    },
-    {
-        name: "list_aether_skills",
-        description: "List project-local Aether SKILL.md procedures and their maintenance state.",
-        inputSchema: {
-            type: "object",
-            properties: {
-                projectRoot: { type: "string" }
-            }
-        }
-    },
-    {
-        name: "maintain_aether_skill",
-        description: "Maintain a project-local Aether skill: keep valuable skills, patch outdated instructions, consolidate near-duplicates, or prune stale skills.",
-        inputSchema: {
-            type: "object",
-            properties: {
-                projectRoot: { type: "string" },
-                name: { type: "string" },
-                action: { type: "string", enum: ["keep", "patch", "consolidate", "prune"] },
-                reason: { type: "string" },
-                patchBody: { type: "string", description: "Full replacement SKILL.md content when action=patch." },
-                consolidateInto: { type: "string", description: "Target skill name when action=consolidate." }
-            },
-            required: ["name", "action", "reason"]
-        }
-    },
-    {
-        name: "compact_aether_memory",
-        description: "Prune and compact project-local Aether memory according to caps, then refresh .aether/memory/learned.json.",
-        inputSchema: {
-            type: "object",
-            properties: {
-                projectRoot: { type: "string" }
-            }
-        }
-    },
-    {
-        name: "act",
-        description: "PRIMARY ACTION TOOL. Perform precise, high-speed actions in the browser. Uses native events which correctly trigger React/SPA state (unlike raw JS `value=` assignments). Supports navigation, clicking, typing, scrolling, and tab management with atomic verification.",
-        inputSchema: {
-            type: "object",
-            properties: {
-                action: {
-                    type: "string",
-                    enum: [
-                        "navigate", "click", "type", "fill", "select", "check",
-                        "hover", "scroll", "wait", "screenshot",
-                        "new_tab", "switch_tab", "close_tab", "drag_and_drop", "upload_file",
-                        "get_tree", "get_dom_tree", "configure", "print_pdf", "emulate_network",
-                        "get_cookies", "set_cookie", "clear_cache", "set_geolocation", "set_timezone", "get_performance_metrics",
-                        "start_screencast", "stop_screencast", "record_session", "sample_visual_frames",
-                        "mock_network_request", "highlight_elements",
-                        "assert", "start_tracing", "stop_tracing",
-                        "screenshot_region", "verify_ui_state", "get_dom_snapshot", "get_event_listeners",
-                        "get_computed_style", "get_network_traffic", "get_network_response",
-                        "get_screencast_frames", "get_dom_storage", "get_logs", "press_key", "key_combo",
-                        "click_text", "click_role", "fill_label", "element_at_point", "detect_captcha"
-                    ],
-                    description: "The action to perform."
-                },
-                selector: { type: "string", description: "CSS selector or text content to interact with." },
-                text: { type: "string", description: "Text to click, type, or match." },
-                key: { type: "string", description: "Keyboard key for press_key/key_combo." },
-                role: { type: "string", description: "ARIA/native role hint for semantic actions." },
-                name: { type: "string", description: "Accessible name for click_role." },
-                label: { type: "string", description: "Visible or accessible label for fill_label." },
-                elementId: { type: "string", description: "Element ID from `get_state` (e.g., '1' or '@1'). Preferred over selector. Both formats are accepted." },
-                value: { type: "string", description: "Value to type, option to select, or URL to navigate to." },
-                assertionType: { type: "string", description: "Assertion type for 'assert' action (e.g., 'element_exists', 'element_not_exists', 'element_contains_text', 'url_contains')." },
-                options: { type: "object", description: "Options for the action (e.g., {x, y, width, height} for screenshot_region)." },
-                domain: { type: "string", description: "CDP domain to enable (for enable_domain action)." },
-                coordinate: { type: "string", description: "X,Y coordinates (e.g., '100,200')." },
-                x: { type: "number", description: "X coordinate." },
-                y: { type: "number", description: "Y coordinate." },
-                visible: { type: "boolean", description: "Require visible selector when waiting. Default varies by action." },
-                stable: { type: "boolean", description: "Require stable element bounds when waiting. Default varies by action." },
-                parentId: { type: "string", description: "Parent task ID for hierarchical tracking (UFO3)." },
-                projectRoot: { type: "string", description: "Optional project root for recording distilled Aether lessons when recovery succeeds." },
-                tabId: { type: "number", description: "Tab ID for switching/closing." },
-                files: { type: "array", items: { type: "string" }, description: "Files for upload_file action" },
-                modifiers: { type: "array", items: { type: "string" }, description: "Key modifiers (Ctrl, Alt, etc.)" },
+/** The agent calling this tool, from MCP request metadata. */
+function callerKey(request: any): string {
+    const meta = request?.params?._meta;
+    const id = meta?.["ai.opencode/sessionID"] ?? meta?.sessionId ?? meta?.session_id;
+    return typeof id === "string" && id ? `mcp-${id}` : "shared";
+}
 
-                // Screencast / Record params
-                format: { type: "string", description: "Image format (jpeg/png). Default: jpeg" },
-                quality: { type: "number", description: "Compression quality (0-100). Default: 50" },
-                maxWidth: { type: "number", description: "Max width of the frame. Default: 1024" },
-                maxHeight: { type: "number", description: "Max height of the frame. Default: 768" },
-                everyNthFrame: { type: "number", description: "Frequency of captured frames. Default: 10" },
-                maxFrames: { type: "number", description: "Maximum number of frames to return. Default: all" },
-                duration: { type: "number", description: "Duration in ms to record (only for record_session). Default: 5000" },
+/** Relay state, from this process or the one that owns the port. */
+async function relayStatusSafe(): Promise<any> {
+    const local = getExtensionRelay().status();
+    if (local.browsers.length > 0 || local.extensionConnected) return local;
+    try {
+        const response = await fetch(`http://127.0.0.1:${local.port}/health`);
+        if (response.ok) return await response.json();
+    } catch {
+        // No relay is listening: report local (empty) state.
+    }
+    return local;
+}
 
-                // CDP specific params
-                cookieName: { type: "string", description: "Name of the cookie to set." },
-                cookieValue: { type: "string", description: "Value of the cookie to set." },
-                latitude: { type: "number", description: "Latitude for geolocation override." },
-                longitude: { type: "number", description: "Longitude for geolocation override." },
-                timezoneId: { type: "string", description: "Timezone ID (e.g., 'America/New_York')." },
+function summarizeSession(record: SessionRecord): Record<string, unknown> {
+    return {
+        id: record.id,
+        name: record.name,
+        createdAt: record.createdAt,
+        lastUsedAt: record.lastUsedAt,
+        ...(record.target ? { target: record.target } : {}),
+    };
+}
 
-                // Mocking & Artifact params
-                urlPattern: { type: "string", description: "URL pattern to mock (e.g., '*api.example.com*')" },
-                mockResponse: { type: "string", description: "Stringified JSON to return as mocked response" },
-                markdownSummary: { type: "string", description: "Summary text for the artifact" },
-                requestId: { type: "string", description: "Request ID for get_network_response" },
+function formatLogs(logs: ExecuteLogEntry[], limit: number = 30): string {
+    if (!logs.length) return "";
+    const lines = logs
+        .slice(-limit)
+        .map((entry) => `[${entry.level}] ${entry.text.replace(/\s*\n\s*/g, " ")}`);
+    return `\n\nLogs (${logs.length}):\n${lines.join("\n")}`;
+}
 
-                // Network Emulation params
-                offline: { type: "boolean" },
-                latency: { type: "number" },
-                downloadThroughput: { type: "number" },
-                uploadThroughput: { type: "number" },
+function describeHandoff(outcome: HandoffOutcome): string {
+    const seconds = Math.round(outcome.waitedMs / 100) / 10;
+    if (outcome.status === "completed") {
+        return (
+            `The user clicked Continue after ${seconds}s.\n\n` +
+            `That is not verification: assert the expected URL or element before treating the step as done.`
+        );
+    }
+    if (outcome.status === "timeout") {
+        return `Timed out after ${seconds}s waiting for the user to click Continue. Ask them whether they still want to proceed.`;
+    }
+    return `The handoff was cancelled after ${seconds}s (${outcome.message}).`;
+}
 
-                // PDF params (subset)
-                landscape: { type: "boolean" },
-                printBackground: { type: "boolean" },
+/**
+ * Resolve the caller's current session to a live Playwright page.
+ *
+ * Never navigates: a pin either resolves to an open tab or reports that it is
+ * gone. If the session has no pin yet, it adopts the browser's first page or
+ * asks the extension for an agent tab.
+ */
+async function resolveHost(
+    caller: string,
+    requestedSession?: string
+): Promise<{ sessions: ReturnType<typeof getSessionManager>; sessionId: string; record: SessionRecord | null; resolved: ResolvedPage; host: PageHost }> {
+    const sessions = getSessionManager();
+    await sessions.load();
+    const driver = getDriver();
+    const sessionId = requestedSession || sessions.currentId(caller);
+    const record = sessions.get(sessionId);
+    const pin = record?.target ?? {};
 
-                // Configuration params
-                network: {
-                    type: "object",
-                    properties: { blockImages: { type: "boolean" }, blockAds: { type: "boolean" }, blockCSS: { type: "boolean" } }
-                },
-                emulation: {
-                    type: "object",
-                    properties: { width: { type: "number" }, height: { type: "number" }, mobile: { type: "boolean" }, userAgent: { type: "string" } }
-                },
-                script: {
-                    type: "object",
-                    properties: { onLoad: { type: "string" } }
-                }
-            },
-            required: ["action"],
-        },
-    },
-    {
-        name: "get_state",
-        description: "Capture the current browser state (v2). Lightweight by default; opt into screenshots, DOM snapshot, SoM overlay, or tabs when needed.",
-        inputSchema: {
-            type: "object",
-            properties: {
-                screenshot: { type: "boolean", description: "Include screenshot. Default false." },
-                domSnapshot: { type: "boolean", description: "Include full DOMSnapshot. Default false." },
-                elements: { type: "boolean", description: "Include interactive elements. Default true." },
-                som: { type: "boolean", description: "Inject Set-of-Marks overlay. Default false." },
-                tabs: { type: "boolean", description: "Include browser tabs. Default false." }
+    let resolved = await driver.getPage({ id: sessionId, ...pin });
+    if (!resolved) {
+        const browserId = pin.browserId ?? (await driver.defaultBrowserId()) ?? undefined;
+        if (browserId) {
+            const relayTab = await getExtensionRelay().ensureAgentTabFor(browserId, sessionId).catch(() => null);
+            if (relayTab) {
+                await sessions.bind(
+                    sessionId,
+                    { browserId: relayTab.browserId, targetId: `${relayTab.browserId}:${relayTab.tabId}` },
+                    caller
+                );
+            } else {
+                await driver.ensurePage(browserId).catch(() => null);
             }
-        },
-    },
-    {
-        name: "browser_status",
-        description: "FAST IDE TOOL. Return compact browser connection and active target status without launching a browser.",
-        inputSchema: {
-            type: "object",
-            properties: {
-                includeTargets: { type: "boolean", description: "Include known CDP targets/tabs when already connected." }
-            }
-        }
-    },
-    {
-        name: "snapshot_compact",
-        description: "FAST IDE TOOL. Capture a small text-only page snapshot: title, URL, readyState, and a limited interactive element list. No screenshot or DOM snapshot by default.",
-        inputSchema: {
-            type: "object",
-            properties: {
-                maxElements: { type: "number", description: "Maximum interactive elements to return. Default 30." },
-                includeText: { type: "boolean", description: "Include short visible text for elements. Default true." }
-            }
-        }
-    },
-    {
-        name: "list_interactive_elements",
-        description: "FAST IDE TOOL. Return compact clickable/typable element references that can be passed to click_by_ref. Does not inject visual overlays unless requested.",
-        inputSchema: {
-            type: "object",
-            properties: {
-                maxElements: { type: "number", description: "Maximum elements to return. Default 50." },
-                withOverlay: { type: "boolean", description: "Inject Set-of-Marks overlay. Default false." }
-            }
-        }
-    },
-    {
-        name: "click_by_ref",
-        description: "FAST IDE TOOL. Click an element reference returned by snapshot_compact or list_interactive_elements.",
-        inputSchema: {
-            type: "object",
-            properties: {
-                ref: { type: "string", description: "Element reference, usually css:<selector>." }
-            },
-            required: ["ref"]
-        }
-    },
-    {
-        name: "click_by_selector",
-        description: "FAST IDE TOOL. Click a CSS selector with a compact response.",
-        inputSchema: {
-            type: "object",
-            properties: {
-                selector: { type: "string" },
-                timeout: { type: "number", description: "Timeout in ms. Default 5000." }
-            },
-            required: ["selector"]
-        }
-    },
-    {
-        name: "fill_by_selector",
-        description: "FAST IDE TOOL. Focus, clear, and type text into a CSS selector with a compact response.",
-        inputSchema: {
-            type: "object",
-            properties: {
-                selector: { type: "string" },
-                value: { type: "string" },
-                timeout: { type: "number", description: "Timeout in ms. Default 5000." }
-            },
-            required: ["selector", "value"]
-        }
-    },
-    {
-        name: "wait_for_selector",
-        description: "FAST IDE TOOL. Wait for a selector and return a compact boolean result.",
-        inputSchema: {
-            type: "object",
-            properties: {
-                selector: { type: "string" },
-                timeout: { type: "number", description: "Timeout in ms. Default 5000." }
-            },
-            required: ["selector"]
-        }
-    },
-    {
-        name: "wait_for_text",
-        description: "FAST IDE TOOL. Wait until visible page text contains the expected string.",
-        inputSchema: {
-            type: "object",
-            properties: {
-                text: { type: "string" },
-                timeout: { type: "number", description: "Timeout in ms. Default 5000." }
-            },
-            required: ["text"]
-        }
-    },
-    {
-        name: "get_network_errors",
-        description: "FAST IDE TOOL. Return recent failed network entries only, keeping debugging payloads small.",
-        inputSchema: {
-            type: "object",
-            properties: {
-                limit: { type: "number", description: "Maximum errors to return. Default 20." }
-            }
-        }
-    },
-    {
-        name: "browser_intent",
-        description: "NATURAL IDE TOOL. Perform a high-level browser intent such as click, fill, select, check, wait_for, inspect, or navigate. Resolves targets by selector, role, text, aria-label, label, placeholder, name, and visibility before acting.",
-        inputSchema: {
-            type: "object",
-            properties: {
-                intent: { type: "string", enum: ["click", "fill", "select", "check", "wait_for", "inspect", "navigate"] },
-                target: { type: "string", description: "Natural target such as 'login', 'Email', 'Submit', or a CSS selector." },
-                value: { type: "string", description: "Value for fill/select/navigate or expected text for wait_for." },
-                role: { type: "string", description: "Optional role hint such as button, link, textbox, checkbox, combobox." },
-                timeout: { type: "number", description: "Timeout in ms. Default 7000." },
-                verify: { type: "string", description: "Optional text to wait for after the action." },
-                includeCandidates: { type: "boolean", description: "Include resolver candidates for debugging. Default false." }
-            },
-            required: ["intent"]
-        }
-    },
-    {
-        name: "get_logs",
-        description: "FAST DEBUG TOOL. Return recent console logs, runtime exceptions, browser log entries, and JavaScript dialogs.",
-        inputSchema: {
-            type: "object",
-            properties: {
-                limit: { type: "number", description: "Maximum log entries to return. Default 50." }
-            }
-        }
-    },
-    {
-        name: "detect_captcha",
-        description: "SAFE GUARD TOOL. Detect common CAPTCHA/human-verification widgets and report manual-solve requirement without interacting with them.",
-        inputSchema: { type: "object", properties: {} }
-    },
-    {
-        name: "solve_captcha",
-        description: "AUTO-SOLVE TOOL. Solves the CAPTCHA on the current page by simulating human mouse movement and clicking the widget (no API key needed). Works for Cloudflare Turnstile, reCAPTCHA v2 checkbox, hCaptcha. Set useService=true to fall back to a third-party solving service for image challenges.",
-        inputSchema: {
-            type: "object",
-            properties: {
-                useService:     { type: "boolean", description: "Use third-party service instead of human simulation. Default false." },
-                service:        { type: "string", enum: ["2captcha", "capsolver"], description: "Service to use when useService=true. Default '2captcha'." },
-                apiKey:         { type: "string", description: "API key for the service. Defaults to env CAPTCHA_API_KEY." },
-                pageUrl:        { type: "string", description: "Page URL passed to the service. Defaults to current browser URL." },
-                waitAfterClick: { type: "number", description: "Ms to wait for captcha to clear after human click. Default 8000." },
-                timeout:        { type: "number", description: "Max wait for service solution in ms. Default 120000." },
-                pollInterval:   { type: "number", description: "Service poll interval in ms. Default 5000." }
-            }
-        }
-    },
-    {
-        name: "press_key",
-        description: "FAST IDE TOOL. Press a keyboard key or shortcut using native CDP key events.",
-        inputSchema: {
-            type: "object",
-            properties: {
-                key: { type: "string", description: "Key such as Enter, Tab, Escape, Backspace, ArrowDown, or a single letter." },
-                modifiers: { type: "array", items: { type: "string" }, description: "Optional modifiers such as Ctrl, Shift, Alt, Meta." }
-            },
-            required: ["key"]
-        }
-    },
-    {
-        name: "click_text",
-        description: "FAST IDE TOOL. Click a visible element by text with optional role hint and compact post-action facts.",
-        inputSchema: {
-            type: "object",
-            properties: {
-                text: { type: "string" },
-                role: { type: "string" },
-                timeout: { type: "number" }
-            },
-            required: ["text"]
-        }
-    },
-    {
-        name: "click_role",
-        description: "FAST IDE TOOL. Click a visible element by role and accessible name.",
-        inputSchema: {
-            type: "object",
-            properties: {
-                role: { type: "string" },
-                name: { type: "string" },
-                timeout: { type: "number" }
-            },
-            required: ["role"]
-        }
-    },
-    {
-        name: "fill_label",
-        description: "FAST IDE TOOL. Fill a textbox-like field by visible/accessibility label with compact post-action facts.",
-        inputSchema: {
-            type: "object",
-            properties: {
-                label: { type: "string" },
-                value: { type: "string" },
-                role: { type: "string" },
-                timeout: { type: "number" }
-            },
-            required: ["label", "value"]
-        }
-    },
-    {
-        name: "element_at_point",
-        description: "FAST DEBUG TOOL. Inspect the element that would receive a coordinate click.",
-        inputSchema: {
-            type: "object",
-            properties: {
-                x: { type: "number" },
-                y: { type: "number" },
-                coordinate: { type: "string", description: "Alternative X,Y coordinate string." }
-            }
-        }
-    },
-    {
-        name: "execute_script",
-        description: "Execute arbitrary JavaScript in the browser context. Tip: wrap your code in a block `{}` or IIFE to avoid `SyntaxError: Identifier has already been declared` when reusing variable names across multiple calls.",
-        inputSchema: {
-            type: "object",
-            properties: { script: { type: "string" } },
-            required: ["script"],
-        },
-    },
-    {
-        name: "cdp_command",
-        description: "Execute a raw Chrome DevTools Protocol (CDP) command on the active tab.",
-        inputSchema: {
-            type: "object",
-            properties: {
-                command: { type: "string", description: "The CDP command method (e.g., 'Network.getCookies')." },
-                args: { type: "object", description: "The JSON arguments required by the CDP command." }
-            },
-            required: ["command"],
-        }
-    },
-    {
-        name: "connect_browser",
-        description: "Connect to a browser over CDP: attach to an existing debugging port, launch a browser, or return choices.",
-        inputSchema: {
-            type: "object",
-            properties: {
-                mode: { type: "string", enum: ["connect", "launch", "auto", "ask"], description: "Connect to a CDP port, launch a browser, or return choices." },
-                port: { type: "number", description: "Browser debugging port (default: 9222)." },
-                headless: { type: "boolean", description: "Run in headless mode (only for launch mode)." },
-                browser: { type: "string", enum: ["chrome", "edge", "brave", "firefox"], description: "Browser to use (default: auto-detect, or brave when profile is set)." },
-                profile: { type: "string", description: "Named browser profile to launch, e.g. Personal or Work. Defaults browser to brave when set." },
-                profileDirectory: { type: "string", description: "Exact Chromium profile directory, e.g. Default or Profile 1." },
-                userDataDir: { type: "string", description: "Chromium user data root to use with profileDirectory." }
-            }
-        }
-    },
-    {
-        name: "launch_browser",
-        description: "Launch a browser (auto-detects available browsers if not specified).",
-        inputSchema: {
-            type: "object",
-            properties: {
-                browser: { type: "string", enum: ["chrome", "edge", "brave", "firefox"], description: "Browser to launch (default: auto-detect first available)." },
-                headless: { type: "boolean", description: "Run in headless mode." },
-                port: { type: "number", description: "Debugging port (default: 9222)." },
-                profile: { type: "string", description: "Named browser profile to launch, e.g. Personal or Work. Defaults browser to brave when set." },
-                profileDirectory: { type: "string", description: "Exact Chromium profile directory, e.g. Default or Profile 1." },
-                userDataDir: { type: "string", description: "Chromium user data root to use with profileDirectory." }
-            }
-        }
-    },
-    {
-        name: "kill_browser",
-        description: "Kill the launched browser process when done.",
-        inputSchema: { type: "object", properties: {} }
-    },
-    {
-        name: "list_browsers",
-        description: "List all available browsers on the system.",
-        inputSchema: { type: "object", properties: {} }
-    },
-    {
-        name: "list_browser_profiles",
-        description: "List Chromium profiles that can be launched with browser control. Defaults to Brave.",
-        inputSchema: {
-            type: "object",
-            properties: {
-                browser: { type: "string", enum: ["chrome", "edge", "brave"], description: "Browser profile store to inspect. Default: brave." }
-            }
-        }
-    },
-    {
-        name: "sample_visual_frames",
-        description: "VISION TOOL. Capture a few compressed screencast frames so the agent can inspect animation/video/dynamic UI without recording a large session.",
-        inputSchema: {
-            type: "object",
-            properties: {
-                duration: { type: "number", description: "Sampling duration in ms. Default 1500, max 10000." },
-                maxFrames: { type: "number", description: "Maximum frames to return. Default 4, max 12." },
-                quality: { type: "number", description: "JPEG quality. Default 45." },
-                maxWidth: { type: "number", description: "Max frame width. Default 800." },
-                maxHeight: { type: "number", description: "Max frame height. Default 600." },
-                everyNthFrame: { type: "number", description: "CDP frame sampling interval. Default 3." }
-            }
-        }
-    },
-    // ==================== AGENT-CENTRIC APIs ====================
-    {
-        name: "agent_action",
-        description: "WARNING: Can return massive payloads (>100KB) with full DOM state and logs. Prefer using `act` for routine operations. Execute an action and optionally verify UI state. Unified action API that combines action + wait + verify in one call. Returns screenshot after action.",
-        inputSchema: {
-            type: "object",
-            properties: {
-                action: {
-                    type: "string",
-                    enum: ["click", "type", "scroll", "hover", "drag", "key_press"],
-                    description: "Action to perform."
-                },
-                target: {
-                    type: "object",
-                    properties: {
-                        id: { type: "string", description: "Element ID from page_snapshot" },
-                        selector: { type: "string", description: "CSS selector" },
-                        text: { type: "string", description: "Text to match" },
-                        x: { type: "number", description: "X coordinate" },
-                        y: { type: "number", description: "Y coordinate" },
-                        button: { type: "string", enum: ["left", "middle", "right"] },
-                        clickCount: { type: "number" },
-                        key: { type: "string", description: "Key to press" },
-                        modifiers: { type: "array", items: { type: "string" } }
-                    }
-                },
-                verify: {
-                    type: "object",
-                    properties: {
-                        selector: { type: "string" },
-                        expectedText: { type: "string" },
-                        type: { type: "string", enum: ["element_exists", "element_contains_text", "text_match", "element_visible"] }
-                    }
-                },
-                waitFor: {
-                    type: "object",
-                    properties: {
-                        type: { type: "string", enum: ["network_idle", "element", "navigation"] },
-                        selector: { type: "string" },
-                        timeout: { type: "number" }
-                    }
-                },
-                screenshot: { type: "boolean", description: "Return screenshot after action. Default false." },
-                timeout: { type: "number", description: "Timeout in ms (default: 10000)" }
-            },
-            required: ["action", "target"]
-        }
-    },
-    {
-        name: "smart_navigate",
-        description: "Navigate to URL with built-in waiting for page stability. Auto-dismisses popups. Returns screenshot of loaded page.",
-        inputSchema: {
-            type: "object",
-            properties: {
-                url: { type: "string", description: "URL to navigate to." },
-                waitFor: {
-                    type: "object",
-                    properties: {
-                        type: { type: "string", enum: ["element", "network_idle"] },
-                        selector: { type: "string" },
-                        timeout: { type: "number" }
-                    }
-                },
-                dismissPopups: { type: "boolean", description: "Auto-dismiss popups (default: true)" },
-                screenshot: { type: "boolean", description: "Return screenshot (default: true)" },
-                timeout: { type: "number", description: "Navigation timeout in ms (default: 30000)" }
-            },
-            required: ["url"]
-        }
-    },
-    {
-        name: "observe_and_act",
-        description: "Execute an action and observe page state changes. Returns before/after snapshots to detect what changed.",
-        inputSchema: {
-            type: "object",
-            properties: {
-                action: {
-                    type: "object",
-                    properties: {
-                        type: { type: "string", enum: ["click", "type"] },
-                        selector: { type: "string" },
-                        text: { type: "string" }
-                    }
-                },
-                observe: {
-                    type: "object",
-                    properties: {
-                        type: { type: "string", enum: ["dom_change", "network_response"] }
-                    }
-                },
-                returnScreenshot: { type: "boolean", description: "Return screenshots (default: true)" }
-            },
-            required: ["action"]
-        }
-    },
-    {
-        name: "agent_form_fill",
-        description: "Intelligently fill form fields. Auto-detects field types (text, select, checkbox, radio, file).",
-        inputSchema: {
-            type: "object",
-            properties: {
-                fields: {
-                    type: "array",
-                    items: {
-                        type: "object",
-                        properties: {
-                            id: { type: "string" },
-                            selector: { type: "string" },
-                            type: { type: "string", enum: ["text", "email", "password", "select", "checkbox", "radio", "file", "textarea"] },
-                            value: { type: "string" },
-                            checked: { type: "boolean" },
-                            files: { type: "array", items: { type: "string" } }
-                        }
-                    },
-                    description: "Form fields to fill."
-                },
-                submitAfterFill: { type: "boolean", description: "Submit form after filling (default: false)" },
-                submitSelector: { type: "string", description: "Selector for submit button" }
-            },
-            required: ["fields"]
-        }
-    },
-    {
-        name: "get_page_text",
-        description: "READ TOOL. Extract clean, readable page content as Markdown (or plain text). Token-cheap alternative to screenshots or full DOM dumps for reading/understanding a page. Scopes to a CSS selector when given, otherwise auto-detects the main content region.",
-        inputSchema: {
-            type: "object",
-            properties: {
-                format: { type: "string", enum: ["markdown", "text"], description: "Output format. Default markdown." },
-                selector: { type: "string", description: "Optional CSS selector to scope extraction to a region." },
-                includeLinks: { type: "boolean", description: "Render anchors as [text](href) in markdown. Default true." },
-                maxLength: { type: "number", description: "Max characters returned before truncation. Default 20000." }
-            }
-        }
-    },
-    {
-        name: "save_auth_state",
-        description: "SESSION TOOL. Export the current browser session (cookies + localStorage + sessionStorage) to a JSON file so a logged-in session can be reused later with load_auth_state. Avoids repeating logins.",
-        inputSchema: {
-            type: "object",
-            properties: {
-                path: { type: "string", description: "File path to write the auth state JSON. Defaults to <cwd>/.aether/auth-state.json." },
-                origins: { type: "array", items: { type: "string" }, description: "Optional list of origins to capture storage for. Defaults to the current origin." }
-            }
-        }
-    },
-    {
-        name: "load_auth_state",
-        description: "SESSION TOOL. Restore a previously saved session (cookies + localStorage + sessionStorage) from a JSON file written by save_auth_state. Navigate to the target site first, then load, then reload.",
-        inputSchema: {
-            type: "object",
-            properties: {
-                path: { type: "string", description: "File path to read the auth state JSON. Defaults to <cwd>/.aether/auth-state.json." },
-                reload: { type: "boolean", description: "Reload the active tab after restoring so storage takes effect. Default true." }
-            }
-        }
-    },
-    {
-        name: "page_snapshot",
-        description: "Capture page context optimized for LLM consumption. Lightweight by default; opt into screenshots, cookies, accessibility tree, or full DOM snapshot when needed.",
-        inputSchema: {
-            type: "object",
-            properties: {
-                fullPage: { type: "boolean", description: "Full page screenshot (default: false)" },
-                includeDOMSnapshot: { type: "boolean", description: "Include full DOM snapshot (default: false)" },
-                screenshot: { type: "boolean", description: "Include screenshot. Default false." },
-                cookies: { type: "boolean", description: "Include cookies. Default false." },
-                accessibilityTree: { type: "boolean", description: "Include simplified accessibility tree. Default false." }
-            }
+            resolved = await driver.getPage({ id: sessionId, ...(sessions.get(sessionId)?.target ?? {}) });
         }
     }
-];
+
+    if (!resolved) {
+        throw new Error(
+            'No page is available. Call browser {action:"extension"} to use your own browser, or browser {action:"launch"} to start one.'
+        );
+    }
+
+    const key = `${resolved.browserId}:${resolved.targetId ?? resolved.page.url()}`;
+    const host = getOrCreatePageHost(
+        key,
+        () =>
+            new PageHost(resolved!.page, resolved!.context, resolved!.browser, {
+                browserId: resolved!.browserId,
+                targetId: resolved!.targetId,
+                targetIdOf: (page) => getDriver().targetIdOf(page),
+            })
+    );
+    setActivePageHost(host);
+    return { sessions, sessionId, record: sessions.get(sessionId), resolved, host };
+}
+
+function routeTool(name: string, args: any): { name: string; args: any } {
+    const a = args ?? {};
+
+    if (name === "sessions") {
+        switch (String(a.action ?? "list")) {
+            case "new":
+                return { name: "session_new", args: { name: a.name, browser: a.browser, adoptCurrent: a.adoptCurrent } };
+            case "use":
+                return { name: "session_use", args: { id: a.id } };
+            case "reset":
+                return { name: "session_reset", args: { id: a.id } };
+            case "delete":
+                return { name: "session_delete", args: { id: a.id } };
+            case "adopt":
+                return { name: "session_adopt", args: { session: a.session, tabId: a.tabId, targetUrl: a.targetUrl, targetIndex: a.targetIndex } };
+            case "save_auth":
+                return { name: "save_auth_state", args: { path: a.path } };
+            case "load_auth":
+                return { name: "load_auth_state", args: { path: a.path, reload: a.reload } };
+            default:
+                return { name: "session_list", args: {} };
+        }
+    }
+
+    if (name === "browser") {
+        switch (String(a.action ?? "status")) {
+            case "launch":
+                return { name: "launch_browser", args: a };
+            case "connect":
+                return { name: "connect_browser", args: a };
+            case "kill":
+                return { name: "kill_browser", args: a };
+            case "list":
+                return { name: "list_browsers", args: {} };
+            case "profiles":
+                return { name: "list_browser_profiles", args: { browser: a.browser } };
+            case "extension":
+                return { name: "extension_connect", args: a };
+            default:
+                return { name: "browser_status", args: { includeTargets: a.includeTargets } };
+        }
+    }
+
+    if (name === "diagnostics") {
+        switch (String(a.action ?? "logs")) {
+            case "network":
+                return { name: "get_network_errors", args: { limit: a.limit } };
+            case "performance":
+                return { name: "get_performance_metrics", args: {} };
+            case "har_start":
+                return { name: "har_start", args: a };
+            case "har_stop":
+                return { name: "har_stop", args: a };
+            case "har_status":
+                return { name: "har_status", args: a };
+            default:
+                return { name: "get_logs", args: { limit: a.limit } };
+        }
+    }
+
+    if (name === "secrets") {
+        return { name: "secrets", args: a };
+    }
+
+    if (name === "captcha") {
+        return a.action === "solve"
+            ? { name: "solve_captcha", args: a }
+            : { name: "detect_captcha", args: {} };
+    }
+
+    if (name === "memory") {
+        switch (String(a.action ?? "recall")) {
+            case "configure":
+                return { name: "configure_aether_memory", args: { projectRoot: a.projectRoot } };
+            case "remember":
+                return { name: "remember_aether_lesson", args: a };
+            case "outcome":
+                return { name: "record_aether_lesson_outcome", args: { projectRoot: a.projectRoot, id: a.id, success: a.success, evidence: a.evidence } };
+            case "compact":
+                return { name: "compact_aether_memory", args: { projectRoot: a.projectRoot } };
+            case "graph":
+                return { name: "get_task_graph", args: {} };
+            default:
+                return { name: "recall_aether_memory", args: { projectRoot: a.projectRoot, intent: a.intent, problem: a.problem, tags: a.tags, limit: a.limit } };
+        }
+    }
+
+    if (name === "skill") {
+        switch (String(a.action ?? "list")) {
+            case "create":
+                return { name: "create_aether_skill", args: a };
+            case "maintain":
+                return { name: "maintain_aether_skill", args: a };
+            default:
+                return { name: "list_aether_skills", args: { projectRoot: a.projectRoot } };
+        }
+    }
+
+    if (name === "act") {
+        switch (String(a.action ?? "")) {
+            case "click_by_ref":
+                return { name: "click_by_ref", args: a };
+            case "click_by_selector":
+                return { name: "click_by_selector", args: a };
+            case "fill_by_selector":
+                return { name: "fill_by_selector", args: a };
+            case "wait_for_selector":
+                return { name: "wait_for_selector", args: a };
+            case "wait_for_text":
+                return { name: "wait_for_text", args: a };
+            case "smart_navigate":
+                return { name: "smart_navigate", args: a };
+            case "intent":
+                return { name: "browser_intent", args: a };
+            case "agent_action":
+                return { name: "agent_action", args: { ...a, action: a.agentAction } };
+            case "observe_and_act":
+                return { name: "observe_and_act", args: { ...a, action: a.agentAction } };
+            case "form_fill":
+                return { name: "agent_form_fill", args: { fields: a.fields, submitAfterFill: a.submitAfterFill, submitSelector: a.submitSelector } };
+            case "sample_visual_frames":
+                return { name: "sample_visual_frames", args: a };
+            default:
+                return { name: "act", args: a };
+        }
+    }
+
+    return { name, args: a };
+}
+
+const Tools = MERGED_TOOL_DEFINITIONS.map((tool: any) => ({
+    ...tool,
+    annotations: TOOL_ANNOTATIONS[tool.name] ?? {
+        readOnlyHint: false,
+        destructiveHint: true,
+        idempotentHint: false,
+        openWorldHint: true,
+    },
+    ...(OUTPUT_SCHEMAS[tool.name] ? { outputSchema: OUTPUT_SCHEMAS[tool.name] } : {}),
+}));
+
+// ─── action implementations ─────────────────────────────────────────────
+
+async function withCdp(host: PageHost) {
+    const session = await host.rawCdp();
+    return async (method: string, params: Record<string, unknown> = {}) => {
+        assertCdpAllowed(method);
+        return await session.send(method as any, params as any);
+    };
+}
+
+async function runAct(host: PageHost, a: any, sessionId: string): Promise<any> {
+    const cdp = await withCdp(host);
+    const action = String(a.action ?? "");
+
+    switch (action) {
+        case "navigate":
+        case "smart_navigate": {
+            const url = a.url ?? a.value;
+            await host.navigate(String(url));
+            if (a.waitFor?.type === "selector") await host.waitForSelector(String(a.waitFor.selector));
+            if (a.waitFor?.type === "text") await host.waitForText(String(a.waitFor.text));
+            const result: any = { success: true, url: await host.url(), title: await host.title() };
+            if (a.screenshot) result.screenshot = (await host.screenshot({ fullPage: false })).base64 ?? null;
+            return result;
+        }
+        case "new_tab":
+            return { targetId: await host.newTab(a.url ?? a.value) };
+        case "switch_tab": {
+            const tabs = await host.tabs();
+            const tab = tabs.find((candidate) => candidate.id === String(a.tabId));
+            if (!tab) throw new Error(`No tab ${a.tabId}. snapshot {tabs:true} lists them.`);
+            await getSessionManager().bind(sessionId, {
+                browserId: host.browserId,
+                targetId: tab.id,
+                urlIncludes: tab.url,
+                title: tab.title,
+            });
+            return { success: true, switchedTo: tab };
+        }
+        case "close_tab":
+            return { closed: await host.closeTab(a.tabId === undefined ? undefined : String(a.tabId)) };
+
+        case "click":
+        case "click_by_selector":
+            return { success: true, result: await host.click(a.ref ?? a.selector ?? a.text ?? "") };
+        case "click_by_ref":
+            return { success: true, ref: a.ref, result: await host.click(String(a.ref)) };
+        case "click_text":
+            return { success: true, result: await host.getByText(String(a.text)).click() };
+        case "click_role":
+            return { success: true, result: await host.getByRole(String(a.role), { name: a.name }).click() };
+
+        case "fill":
+        case "fill_by_selector":
+            return { success: true, result: await host.fill(a.selector ?? a.ref ?? "", a.value ?? a.text ?? "") };
+        case "fill_label":
+            return { success: true, result: await host.getByLabel(String(a.label)).fill(String(a.value ?? "")) };
+        case "type":
+            return { success: true, result: await host.type(a.selector ?? a.ref ?? a.text ?? "", a.value ?? a.text ?? "") };
+        case "press_key":
+        case "key_combo":
+            return { success: true, result: await host.press(String(a.key), a.modifiers ?? []) };
+        case "hover":
+            return { success: true, result: await host.hover(a.selector ?? a.ref ?? String(a.text ?? "")) };
+        case "scroll":
+            return { success: true, result: await host.scroll(Number(a.deltaY ?? a.y ?? 500)) };
+        case "select":
+        case "select_option":
+            return { success: true, result: await host.selectOption(a.selector ?? a.ref ?? "", String(a.value ?? "")) };
+        case "check": {
+            const { locator } = await host.resolveTarget(a.selector ?? a.ref ?? "");
+            const tag = await locator.evaluate((element) => (element as HTMLInputElement).type);
+            if (tag === "checkbox" || tag === "radio") await locator.check({ timeout: 15_000 });
+            else await locator.click({ timeout: 15_000 });
+            return { success: true };
+        }
+        case "drag_and_drop": {
+            const source = await host.resolveTarget(a.selector ?? a.ref ?? "");
+            const target = await host.resolveTarget(a.target ?? a.value ?? "");
+            await source.locator.dragTo(target.locator, { timeout: 15_000 });
+            return { success: true };
+        }
+        case "upload_file": {
+            const { locator } = await host.resolveTarget(a.selector ?? a.ref ?? "");
+            await locator.setInputFiles(a.files ?? [], { timeout: 15_000 });
+            return { success: true };
+        }
+
+        case "wait":
+            await host.waitForTimeout(Number(a.timeout ?? a.duration ?? 1000));
+            return { success: true };
+        case "wait_for_selector":
+            return { success: await host.waitForSelector(String(a.selector), Number(a.timeout ?? 15_000)) };
+        case "wait_for_text":
+            return { success: await host.waitForText(String(a.text), Number(a.timeout ?? 15_000)) };
+        case "assert":
+        case "verify_ui_state": {
+            const snapshot = await host.snapshot({ maxElements: 40 });
+            return { success: true, url: snapshot.url, title: snapshot.title, elementCount: snapshot.elementCount, outline: snapshot.outline };
+        }
+
+        case "screenshot": {
+            const shot = await host.screenshot({ fullPage: a.fullPage === true, format: a.format === "png" ? "png" : "jpeg", quality: a.quality });
+            return shot.base64 ? { screenshot: shot.base64, mimeType: shot.mimeType } : shot;
+        }
+        case "screenshot_region": {
+            const options = a.options ?? {};
+            const buffer = await host.page.screenshot({
+                clip: {
+                    x: Number(options.x ?? a.x ?? 0),
+                    y: Number(options.y ?? a.y ?? 0),
+                    width: Number(options.width ?? 300),
+                    height: Number(options.height ?? 200),
+                },
+                type: "jpeg",
+                quality: Number(a.quality ?? 70),
+            });
+            return { screenshot: buffer.toString("base64"), mimeType: "image/jpeg" };
+        }
+        case "get_tree":
+            return await cdp("Accessibility.getFullAXTree");
+        case "get_dom_tree":
+        case "get_dom_snapshot":
+            return action === "get_dom_tree"
+                ? { html: await host.content() }
+                : await cdp("DOMSnapshot.captureSnapshot", { computedStyles: [] });
+        case "get_logs":
+            return { logs: host.consoleLogs(Number(a.limit ?? 50)) };
+        case "get_network_errors":
+            return { requests: host.networkErrors(Number(a.limit ?? 20)) };
+        case "get_network_traffic": {
+            const entries = host.networkTraffic(Number(a.limit ?? 50));
+            if (entries.length) return { captured: entries.length, entries, status: host.networkCaptureStatus() };
+            return {
+                note: 'No HAR capture is running. Start one with diagnostics {action:"har_start"}, or read failed requests below.',
+                requests: host.networkErrors(Number(a.limit ?? 50)),
+            };
+        }
+        case "get_network_response": {
+            const entries = host.networkTraffic(500);
+            const needle = String(a.requestId ?? a.urlPattern ?? a.url ?? "").toLowerCase();
+            const match = entries.find(
+                (entry: any) =>
+                    (a.requestId && entry.request?.url?.includes(String(a.requestId))) ||
+                    (needle && entry.request?.url?.toLowerCase().includes(needle))
+            );
+            return match ? { entry: match } : { note: "No captured response matched. Start a capture with diagnostics {action:\"har_start\"} first." };
+        }
+        case "get_performance_metrics": {
+            await cdp("Performance.enable");
+            return await cdp("Performance.getMetrics");
+        }
+        case "get_computed_style": {
+            const value = await host.evaluate((arg: any) => {
+                const element = arg.selector ? document.querySelector(arg.selector) : document.body;
+                if (!element) return null;
+                return Object.fromEntries(Array.from(window.getComputedStyle(element)).map((key) => [key, window.getComputedStyle(element).getPropertyValue(key)]));
+            }, { selector: a.selector });
+            return { style: value };
+        }
+        case "get_event_listeners": {
+            const doc = await cdp("DOM.getDocument");
+            const node = await cdp("DOM.querySelector", { nodeId: (doc as any).root.nodeId, selector: String(a.selector) });
+            if (!(node as any).nodeId) return { listeners: [] };
+            return await cdp("DOMDebugger.getEventListeners", { objectId: (node as any).nodeId });
+        }
+        case "get_dom_storage": {
+            const storage = await host.evaluate(() => ({
+                localStorage: Object.fromEntries(Object.entries(localStorage)),
+                sessionStorage: Object.fromEntries(Object.entries(sessionStorage)),
+            }));
+            return storage;
+        }
+        case "element_at_point":
+            return await cdp("DOM.getNodeForLocation", { x: Number(a.x ?? 0), y: Number(a.y ?? 0) });
+        case "highlight_elements": {
+            await host.evaluate(() => {
+                document.querySelectorAll("[data-aether-highlight]").forEach((element) => element.remove());
+                const nodes = Array.from(document.querySelectorAll("a,button,input,select,textarea,[role]"));
+                for (const node of nodes) {
+                    const rect = node.getBoundingClientRect();
+                    if (!rect.width || !rect.height) continue;
+                    const marker = document.createElement("div");
+                    marker.setAttribute("data-aether-highlight", "1");
+                    marker.style.cssText = `position:fixed;left:${rect.left}px;top:${rect.top}px;width:${rect.width}px;height:${rect.height}px;border:2px solid #22c55e;z-index:2147483647;pointer-events:none`;
+                    document.documentElement.appendChild(marker);
+                }
+                return true;
+            });
+            return { success: true };
+        }
+        case "print_pdf": {
+            const buffer = await host.page.pdf({ printBackground: a.printBackground === true });
+            return { pdf: buffer.toString("base64"), mimeType: "application/pdf" };
+        }
+
+        case "intent": {
+            const target = String(a.target ?? "");
+            const intent = String(a.intent ?? "click");
+            if (intent === "navigate") {
+                await host.navigate(String(a.value ?? target));
+                return { success: true, url: await host.url() };
+            }
+            const handle = a.role ? host.getByRole(String(a.role), { name: target }) : host.getByText(target);
+            if (intent === "click") return { success: true, result: await handle.click() };
+            if (intent === "fill") return { success: true, result: await handle.fill(String(a.value ?? "")) };
+            if (intent === "select") return { success: true, result: await handle.selectOption(String(a.value ?? "")) };
+            if (intent === "check") return { success: true, result: await handle.click() };
+            if (intent === "wait_for") return { success: await host.waitForText(target) };
+            return { success: true, snapshot: await host.snapshot({ maxElements: 40 }) };
+        }
+        case "agent_action":
+        case "observe_and_act": {
+            const inner = String(a.agentAction ?? a.action ?? "click");
+            const target = String(a.target ?? "");
+            if (inner === "click" || inner === "click_text") await host.click(target);
+            else if (inner === "fill") await host.fill(target, a.value ?? "");
+            else if (inner === "hover") await host.hover(target);
+            else if (inner === "navigate") await host.navigate(target);
+            const result: any = { success: true, url: await host.url() };
+            if (a.returnScreenshot || a.screenshot) {
+                result.screenshot = (await host.screenshot({})).base64 ?? null;
+            }
+            return result;
+        }
+        case "form_fill": {
+            for (const field of a.fields ?? []) {
+                const target = field.selector ?? field.label ?? field.id;
+                if (!target) continue;
+                if (field.type === "checkbox" || field.type === "radio") {
+                    if (field.checked !== false) await host.click(target);
+                } else {
+                    await host.fill(target, field.value ?? "");
+                }
+            }
+            if (a.submitAfterFill) {
+                await host.click(a.submitSelector ?? 'button[type="submit"], input[type="submit"]');
+            }
+            return { success: true };
+        }
+
+        case "configure":
+            return { note: "configure is not supported by the Playwright driver." };
+        case "emulate_network":
+            await cdp("Network.enable");
+            return await cdp("Network.emulateNetworkConditions", {
+                offline: a.offline === true,
+                latency: Number(a.latency ?? 0),
+                downloadThroughput: Number(a.downloadThroughput ?? -1),
+                uploadThroughput: Number(a.uploadThroughput ?? -1),
+            });
+        case "mock_network_request": {
+            const pattern = String(a.urlPattern ?? "**/*");
+            const body = String(a.mockResponse ?? "{}");
+            await host.context.route(pattern, (route) => route.fulfill({ status: 200, body, contentType: "application/json" }));
+            return { success: true, pattern };
+        }
+        case "set_geolocation":
+            await host.context.setGeolocation({ latitude: Number(a.latitude ?? 0), longitude: Number(a.longitude ?? 0) });
+            return { success: true };
+        case "set_timezone":
+            return await cdp("Emulation.setTimezoneOverride", { timezoneId: String(a.timezoneId ?? "UTC") });
+        case "get_cookies":
+            return await cdp("Network.getCookies");
+        case "set_cookie":
+            await cdp("Network.enable");
+            return await cdp("Network.setCookie", {
+                name: String(a.cookieName ?? ""),
+                value: String(a.cookieValue ?? ""),
+                url: await host.url(),
+            });
+        case "clear_cache":
+            return { success: false, error: "Refused: clearing the shared browser cache is not allowed." };
+
+        case "start_screencast":
+            return await host.startScreencast(a);
+        case "stop_screencast":
+            return await host.stopScreencast();
+        case "get_screencast_frames":
+            return { frames: host.getScreencastFrames(Number(a.maxFrames ?? 10)) };
+        case "record_session":
+            return await host.recordSession({ ...a, path: a.path ?? a.output });
+        case "sample_visual_frames":
+            return await host.sampleFrames(a);
+        case "start_tracing":
+            return await host.startTracing(a);
+        case "stop_tracing":
+            return await host.stopTracing({ path: a.path ?? a.output });
+
+        case "detect_captcha": {
+            const detected = await host.evaluate(() => {
+                const selectors = [
+                    'iframe[src*="challenges.cloudflare.com"]',
+                    'iframe[src*="hcaptcha"]',
+                    'iframe[title="reCAPTCHA"]',
+                    ".cf-turnstile,.h-captcha,.g-recaptcha",
+                ];
+                return selectors.some((selector) => {
+                    const element = document.querySelector(selector);
+                    if (!element) return false;
+                    const rect = element.getBoundingClientRect();
+                    return rect.width > 0 && rect.height > 0;
+                });
+            });
+            return { detected: detected === true };
+        }
+
+        default:
+            throw new Error(`Action '${action}' is not implemented by the Playwright driver yet.`);
+    }
+}
+
+// ─── registration ───────────────────────────────────────────────────────
 
 export function RegisterMcpTools(server: Server) {
     server.setRequestHandler(ListToolsRequestSchema, async () => ({ tools: Tools }));
 
     server.setRequestHandler(CallToolRequestSchema, async (request) => {
-        const { name, arguments: args } = request.params;
-        const a = args as any;
-        const bridge = getCdpBridge();
+        const requestedName = request.params.name;
+        const routed = routeTool(requestedName, request.params.arguments);
+        const name = routed.name;
+        const a = routed.args as any;
+        const caller = callerKey(request);
+        const sessionArg = typeof a?.session === "string" && a.session ? a.session : undefined;
 
         try {
-            if (name === "get_task_graph") {
-                return jsonContent(taskMemory.graph(), true);
+            const sessions = getSessionManager();
+            const driver = getDriver();
+            const secretStore = getSecretStore();
+            await secretStore.load();
+
+            // ==================== SCRIPTING ====================
+            if (name === "execute") {
+                const { host, sessionId, sessions: store } = await resolveHost(caller, sessionArg);
+                const result = await runExecute(host, {
+                    code: String(a?.code ?? ""),
+                    ...(a?.timeoutMs === undefined ? {} : { timeoutMs: Number(a.timeoutMs) }),
+                    sessionId,
+                });
+                const redacted = {
+                    ...result,
+                    value: secretStore.redactDeep(result.value),
+                    text: secretStore.redact(result.text),
+                    logs: result.logs.map((entry) => ({ ...entry, text: secretStore.redact(entry.text) })),
+                };
+                await store.bind(sessionId, { browserId: host.browserId, targetId: host.targetId ?? undefined }, caller);
+                await store.record(
+                    sessionId,
+                    redacted.isError ? "execute.failed" : "execute",
+                    `${redacted.durationMs}ms${redacted.timedOut ? " (timed out)" : ""}`,
+                    caller
+                );
+
+                const header = redacted.isError
+                    ? `execute failed after ${redacted.durationMs}ms\n\n${redacted.text}`
+                    : redacted.value === undefined
+                      ? `(the script returned no value after ${redacted.durationMs}ms)`
+                      : redacted.text;
+                return jsonToolResult(redacted, { text: `${header}${formatLogs(redacted.logs)}`, isError: redacted.isError });
             }
 
-            if (name === "configure_aether_memory") {
-                return jsonContent(await aetherMemory.configure(a?.projectRoot), true);
+            if (name === "handoff") {
+                const { host } = await resolveHost(caller, sessionArg);
+                const outcome = await host.handoff(String(a?.message ?? ""), {
+                    ...(a?.timeoutMs === undefined ? {} : { timeoutMs: Number(a.timeoutMs) }),
+                    sessionId: sessionArg,
+                });
+                await sessions.record(sessionArg, "handoff", `${outcome.status} after ${outcome.waitedMs}ms`, caller);
+                return jsonToolResult(outcome, { text: describeHandoff(outcome) });
             }
 
+            if (name === "snapshot") {
+                const { host } = await resolveHost(caller, sessionArg);
+                const result = await host.snapshot({
+                    maxElements: a?.elements === false ? 0 : (a?.maxElements ?? 40),
+                    includeText: a?.includeText !== false,
+                    frames: a?.frames !== false,
+                });
+
+                const extras: Record<string, unknown> = {};
+                if (a?.screenshot) {
+                    extras.screenshot = (await host.screenshot({ fullPage: a?.fullPage === true })).base64 ?? null;
+                }
+                if (a?.tabs) extras.tabs = await host.tabs().catch(() => []);
+                if (a?.cookies) extras.cookies = await withCdp(host).then((cdp) => cdp("Network.getCookies")).catch(() => []);
+                if (a?.domSnapshot) extras.domSnapshot = await withCdp(host).then((cdp) => cdp("DOMSnapshot.captureSnapshot", { computedStyles: [] })).catch(() => null);
+                if (a?.accessibilityTree) extras.accessibilityTree = await withCdp(host).then((cdp) => cdp("Accessibility.getFullAXTree")).catch(() => null);
+
+                const redactedResult = secretStore.redactDeep(result);
+                if (Object.keys(extras).length > 0) {
+                    return jsonWithImages({ ...redactedResult, ...secretStore.redactDeep(extras) }, true);
+                }
+                return jsonToolResult(redactedResult, { text: redactedResult.outline });
+            }
+
+            // ==================== SESSIONS ====================
+            if (name === "session_new") {
+                const record = await sessions.create(String(a?.name ?? "session"), caller);
+                const browserId = (a?.browser as string | undefined) ?? (await driver.defaultBrowserId()) ?? undefined;
+                if (browserId) {
+                    const relayTab = await getExtensionRelay().ensureAgentTabFor(browserId, record.id).catch(() => null);
+                    if (relayTab) {
+                        await sessions.bind(record.id, { browserId: relayTab.browserId, targetId: `${relayTab.browserId}:${relayTab.tabId}` }, caller);
+                    } else {
+                        const resolved = await driver.ensurePage(browserId).catch(() => null);
+                        if (resolved) {
+                            await sessions.bind(record.id, { browserId, targetId: resolved.targetId ?? undefined, urlIncludes: resolved.page.url() }, caller);
+                        }
+                    }
+                }
+                const stored = sessions.get(record.id) ?? record;
+                return jsonToolResult(
+                    { current: sessions.currentId(caller), session: summarizeSession(stored) },
+                    {
+                        text: stored.target
+                            ? `Session '${stored.id}' is current in ${stored.target.browserId ?? "a browser"}, pinned to ${stored.target.title || stored.target.urlIncludes || stored.target.targetId}.`
+                            : `Session '${stored.id}' is current with no tab pinned; it pins the tab it first works in.`,
+                    }
+                );
+            }
+
+            if (name === "session_list") {
+                await sessions.load();
+                const records = sessions.list();
+                const lines = records.map((record) => {
+                    const marker = record.id === sessions.currentId(caller) ? "*" : " ";
+                    const where = record.target
+                        ? ` → ${record.target.browserId ?? "browser"}:${record.target.title || record.target.urlIncludes || record.target.targetId}`
+                        : " (unpinned)";
+                    return `${marker} ${record.id}${where} — last used ${record.lastUsedAt}`;
+                });
+                return jsonToolResult(
+                    { current: sessions.currentId(caller), sharedSession: caller === "shared", sessions: records.map(summarizeSession) },
+                    { text: lines.length ? lines.join("\n") : 'No sessions yet. Create one with sessions {action:"new"}.' }
+                );
+            }
+
+            if (name === "session_use") {
+                const record = await sessions.use(String(a?.id ?? ""), caller);
+                const resolved = await driver.getPage({ id: record.id, ...(record.target ?? {}) }).catch(() => null);
+                return jsonToolResult(
+                    { current: sessions.currentId(caller), session: summarizeSession(record) },
+                    {
+                        text: resolved
+                            ? `Session '${record.id}' is current in ${resolved.browserId}.`
+                            : `Session '${record.id}' is current, but its pinned tab is not open; it will pin the tab it next works in.`,
+                    }
+                );
+            }
+
+            if (name === "session_reset") {
+                const record = await sessions.reset(a?.id, caller);
+                return jsonToolResult(
+                    { current: sessions.currentId(caller), session: summarizeSession(record) },
+                    { text: `Cleared the pinned tab and journal for '${record.id}'.` }
+                );
+            }
+
+            if (name === "session_delete") {
+                const result = await sessions.delete(a?.id, caller);
+                return jsonToolResult(result, { text: `Deleted session '${result.deleted}'. Current session is '${result.current}'.` });
+            }
+
+            if (name === "session_adopt") {
+                await sessions.load();
+                const sessionId = sessionArg ?? sessions.currentId(caller);
+                if (!sessions.get(sessionId)) {
+                    throw new Error(`Session not found: ${sessionId}. Create it with sessions {action:"new"} first.`);
+                }
+
+                const browsers = await driver.listBrowsers();
+                const all: Array<{ browserId: string; targetId: string; url: string; title: string }> = [];
+                for (const browser of browsers) {
+                    const targets = await driver.listTargets(browser.id).catch(() => []);
+                    for (const target of targets) all.push(target);
+                }
+
+                let match: (typeof all)[number] | undefined;
+                if (typeof a?.targetIndex === "number") match = all[Number(a.targetIndex)];
+                else if (typeof a?.tabId === "string") match = all.find((candidate) => candidate.targetId === a.tabId || candidate.targetId.endsWith(`:${a.tabId}`));
+                else if (typeof a?.targetUrl === "string") {
+                    const needle = String(a.targetUrl).toLowerCase();
+                    match = all.find((candidate) => candidate.url.toLowerCase().includes(needle) || candidate.title.toLowerCase().includes(needle));
+                }
+
+                if (!match) {
+                    throw new Error('No matching open tab to adopt. Pass tabId (from snapshot {tabs:true}), targetUrl, or targetIndex.');
+                }
+
+                const record = await sessions.bind(
+                    sessionId,
+                    { browserId: match.browserId, targetId: match.targetId, urlIncludes: match.url, title: match.title },
+                    caller
+                );
+                return jsonToolResult(
+                    { current: sessions.currentId(caller), session: summarizeSession(record) },
+                    { text: `Session '${record.id}' now works in ${match.title || match.url}.` }
+                );
+            }
+
+            // ==================== MEMORY / SKILL ====================
+            if (name === "get_task_graph") return jsonContent(taskMemory.graph(), true);
+            if (name === "configure_aether_memory") return jsonContent(await aetherMemory.configure(a?.projectRoot), true);
             if (name === "remember_aether_lesson") {
                 return jsonContent(await aetherMemory.rememberLesson({
                     projectRoot: a?.projectRoot,
@@ -752,7 +794,6 @@ export function RegisterMcpTools(server: Server) {
                     confidence: a?.confidence,
                 }), true);
             }
-
             if (name === "recall_aether_memory") {
                 return jsonContent(await aetherMemory.recallLessons({
                     projectRoot: a?.projectRoot,
@@ -762,16 +803,9 @@ export function RegisterMcpTools(server: Server) {
                     limit: a?.limit,
                 }), true);
             }
-
             if (name === "record_aether_lesson_outcome") {
-                return jsonContent(await aetherMemory.recordLessonOutcome({
-                    projectRoot: a?.projectRoot,
-                    id: a.id,
-                    success: a.success,
-                    evidence: a?.evidence,
-                }), true);
+                return jsonContent(await aetherMemory.recordLessonOutcome({ projectRoot: a?.projectRoot, id: a.id, success: a.success, evidence: a?.evidence }), true);
             }
-
             if (name === "create_aether_skill") {
                 return jsonContent(await aetherMemory.createSkill({
                     projectRoot: a?.projectRoot,
@@ -784,11 +818,7 @@ export function RegisterMcpTools(server: Server) {
                     verification: a?.verification,
                 }), true);
             }
-
-            if (name === "list_aether_skills") {
-                return jsonContent(await aetherMemory.listSkills(a?.projectRoot), true);
-            }
-
+            if (name === "list_aether_skills") return jsonContent(await aetherMemory.listSkills(a?.projectRoot), true);
             if (name === "maintain_aether_skill") {
                 return jsonContent(await aetherMemory.maintainSkill({
                     projectRoot: a?.projectRoot,
@@ -799,558 +829,341 @@ export function RegisterMcpTools(server: Server) {
                     consolidateInto: a?.consolidateInto,
                 }), true);
             }
+            if (name === "compact_aether_memory") return jsonContent(await aetherMemory.compact(a?.projectRoot), true);
 
-            if (name === "compact_aether_memory") {
-                return jsonContent(await aetherMemory.compact(a?.projectRoot), true);
-            }
+            // ==================== BROWSER LIFECYCLE ====================
+            if (name === "extension_connect") {
+                const relay = getExtensionRelay();
+                const { port } = await relay.start();
+                const waitMs = Math.max(0, Math.min(Number(a?.waitMs ?? 3000), 30_000));
+                const deadline = Date.now() + waitMs;
+                while (!(await relayStatusSafe()).extensionConnected && Date.now() < deadline) {
+                    await new Promise((resolve) => setTimeout(resolve, 150));
+                }
 
-            if (name === "connect_browser") {
-                const mode = a?.mode || "auto";
-                const port = a?.port || 9222;
-                const browser = a?.browser || ((a?.profile || a?.profileDirectory) ? "brave" : undefined);
+                const status = await relayStatusSafe();
+                const extensionPath = path.resolve(__dirname, "..", "extension");
 
-                if (mode === "ask") {
-                    const profiles = await bridge.listBrowserProfiles("brave");
-                    const choices = [
-                        { id: "clean", label: "Aether clean browser" },
-                        ...profiles.map((p: any) => ({ id: `${p.browser}:${p.directory}`, label: `${p.name} (${p.browser})` }))
-                    ];
-
-                    const clientCapabilities = (server as any).getClientCapabilities?.();
-                    if (clientCapabilities?.elicitation) {
-                        try {
-                            const response = await (server as any).request({
-                                method: "elicitation/create",
-                                params: {
-                                    message: "Which browser should Aether control?",
-                                    requestedSchema: {
-                                        type: "object",
-                                        properties: {
-                                            choice: {
-                                                type: "string",
-                                                enum: choices.map((choice) => choice.id),
-                                                description: choices.map((choice) => `${choice.id} = ${choice.label}`).join("; ")
-                                            }
-                                        },
-                                        required: ["choice"]
-                                    }
-                                }
-                            }, z.object({
-                                action: z.string(),
-                                content: z.any().optional()
-                            }).passthrough());
-
-                            if (response.action !== "accept") {
-                                return { content: [{ type: "text", text: "Browser launch cancelled." }] };
-                            }
-
-                            const choice = response.content?.choice;
-                            if (choice === "clean") {
-                                const result = await bridge.launchBrowser({ port, headless: a?.headless });
-                                return { content: [{ type: "text", text: result }] };
-                            }
-
-                            const selected = profiles.find((p: any) => `${p.browser}:${p.directory}` === choice);
-                            if (!selected) {
-                                throw new Error(`Unknown browser choice: ${choice}`);
-                            }
-
-                            const result = await bridge.launchBrowser({
-                                browser: selected.browser,
-                                profileDirectory: selected.directory,
-                                userDataDir: selected.userDataDir,
-                                port,
-                                headless: a?.headless,
-                            });
-                            return { content: [{ type: "text", text: result }] };
-                        } catch (error) {
-                            console.error("[MCP] Elicitation failed; falling back to text choices:", error);
+                if (!status.extensionConnected) {
+                    return jsonToolResult(
+                        { ...status, extensionPath },
+                        {
+                            text:
+                                `Relay is listening on 127.0.0.1:${port}. No browser is paired yet.\n\n` +
+                                `1. Install once: chrome://extensions → Developer mode → Load unpacked → ${extensionPath}\n` +
+                                `2. Open the Aether toolbar button. Relay: ws://127.0.0.1:${port} · Pairing code: ${status.pairingCode ?? "run this again"}\n` +
+                                `3. Press Connect, then run browser {action:"extension"} again.\n\n` +
+                                `The code works once and expires in 10 minutes. The browser keeps its token after that.`,
                         }
-                    }
+                    );
+                }
 
-                    const fallbackChoices = [
-                        `Aether clean browser: call launch_browser({ "port": ${port} })`,
-                        ...profiles.map((p: any) =>
-                            `${p.name}: call launch_browser({ "browser": "${p.browser}", "profile": "${p.name}", "port": ${port} })`
-                        )
-                    ].join("\n");
-                    return { content: [{ type: "text", text: `Available controlled browser choices:\n${fallbackChoices}` }] };
+                const browserId = (a?.browser as string | undefined) || status.browsers.find((browser: any) => browser.connected)?.id || status.browsers[0]?.id;
+                if (!browserId) throw new Error("The extension is connected but reported no browser id.");
+
+                let relayTab = await relay.ensureAgentTabFor(browserId, sessionArg ?? "agent").catch(() => null);
+                await driver.connectBrowser(browserId);
+                // A second MCP process does not own the extension link; it asks
+                // the relay's browser endpoint to create a page instead.
+                if (!relayTab) {
+                    const ensured = await driver.ensurePage(browserId).catch(() => null);
+                    if (ensured) relayTab = { browserId, tabId: Number(ensured.targetId?.split(":").pop() ?? 0) };
                 }
-                
-                if (mode === "connect") {
-                    await bridge.sendCommand("connect", { port });
-                    return { content: [{ type: "text", text: "Connected to browser successfully" }] };
-                } else if (mode === "launch") {
-                    const result = await bridge.launchBrowser({ 
-                        browser,
-                        headless: a?.headless, 
-                        port,
-                        profile: a?.profile,
-                        profileDirectory: a?.profileDirectory,
-                        userDataDir: a?.userDataDir,
-                    });
-                    return { content: [{ type: "text", text: result }] };
-                } else {
-                    // auto mode - detect and launch
-                    const result = await bridge.launchBrowser({ 
-                        browser,
-                        headless: a?.headless, 
-                        port,
-                        profile: a?.profile,
-                        profileDirectory: a?.profileDirectory,
-                        userDataDir: a?.userDataDir,
-                    });
-                    return { content: [{ type: "text", text: result }] };
-                }
+                const tabs = await driver.listTargets(browserId).catch(() => []);
+
+                return jsonToolResult(
+                    { ...status, extensionPath, activeBrowser: browserId, agentTab: relayTab, tabs },
+                    {
+                        text:
+                            `Connected to ${browserId} through the Aether extension on port ${port}.\n` +
+                            `${tabs.length} agent tab(s) available. Agent tabs stay in a collapsed group; Aether only sees tabs it opened or you lent it.`,
+                    }
+                );
             }
 
-            if (name === "launch_browser") {
-                const browser = a?.browser || ((a?.profile || a?.profileDirectory) ? "brave" : undefined);
-                const result = await bridge.launchBrowser({ 
-                    browser,
-                    headless: a?.headless,
-                    port: a?.port,
-                    profile: a?.profile,
-                    profileDirectory: a?.profileDirectory,
-                    userDataDir: a?.userDataDir,
-                });
-                return { content: [{ type: "text", text: result }] };
+            if (name === "launch_browser" || name === "connect_browser") {
+                const port = Number(a?.port ?? 9222);
+                if (name === "launch_browser") {
+                    await launchBrowserProcess({
+                        browser: a?.browser,
+                        headless: a?.headless === true,
+                        port,
+                        profile: a?.profile,
+                        profileDirectory: a?.profileDirectory,
+                        userDataDir: a?.userDataDir,
+                    });
+                }
+                const browserId = `launched:${port}`;
+                await driver.connectBrowser(browserId);
+                const resolved = await driver.ensurePage(browserId, a?.url).catch(() => null);
+                return jsonToolResult(
+                    { browserId, port, url: resolved?.page.url() ?? null },
+                    { text: `Connected to ${browserId} over CDP on port ${port}.` }
+                );
             }
 
             if (name === "kill_browser") {
-                const result = await bridge.killBrowser();
-                return { content: [{ type: "text", text: result }] };
+                const port = Number(a?.port ?? 9222);
+                const killed = killLaunchedBrowser(port);
+                return jsonToolResult({ killed, port }, {
+                    text: killed ? `Killed the launched browser on port ${port}.` : `No launched browser is tracked on port ${port}. Your extension browser is never closed by Aether.`,
+                });
             }
 
             if (name === "list_browsers") {
-                const browsers = await bridge.listBrowsers();
-                if (browsers.length === 0) {
-                    return { content: [{ type: "text", text: "No supported browsers found. Please install Chrome, Edge, Brave, or Firefox." }] };
-                }
-                const list = browsers.map((b: any) => `${b.name}: ${b.path}`).join("\n");
-                return { content: [{ type: "text", text: `Available browsers:\n${list}` }] };
+                const browsers = await listAvailableBrowsers();
+                return jsonToolResult({ browsers }, {
+                    text: browsers.length ? browsers.map((browser) => `${browser.name}: ${browser.path}`).join("\n") : "No supported browser found. Install Chrome, Edge, Brave, or Firefox.",
+                });
             }
 
             if (name === "list_browser_profiles") {
-                const profiles = await bridge.listBrowserProfiles(a?.browser || "brave");
-                if (profiles.length === 0) {
-                    return { content: [{ type: "text", text: `No profiles found for ${a?.browser || "brave"}.` }] };
-                }
-                const list = profiles
-                    .map((p: any) => `${p.name}: ${p.browser}, directory=${p.directory}, userDataDir=${p.userDataDir}`)
-                    .join("\n");
-                return { content: [{ type: "text", text: `Available browser profiles:\n${list}` }] };
-            }
-
-            if (name === "sample_visual_frames") {
-                const result = await bridge.sendCommand("sample_visual_frames", {
-                    duration: a?.duration,
-                    maxFrames: a?.maxFrames,
-                    quality: a?.quality,
-                    maxWidth: a?.maxWidth,
-                    maxHeight: a?.maxHeight,
-                    everyNthFrame: a?.everyNthFrame
+                const profiles = await listBrowserProfiles(a?.browser || "brave");
+                return jsonToolResult({ profiles }, {
+                    text: profiles.length
+                        ? profiles.map((profile) => `${profile.name}: ${profile.browser}, directory=${profile.directory}`).join("\n")
+                        : `No profiles found for ${a?.browser || "brave"}.`,
                 });
-                const content: any[] = [{
-                    type: "text",
-                    text: JSON.stringify({
-                        success: result.success,
-                        frameCount: result.frameCount,
-                        duration: result.duration,
-                        timestamps: result.timestamps
-                    })
-                }];
-                for (const frame of result.frames || []) {
-                    content.push(imageContent(frame, "image/jpeg"));
-                }
-                return { content };
-            }
-
-            if (name === "get_state") {
-                const result = await bridge.sendCommand("get_state", {
-                    screenshot: a?.screenshot === true,
-                    domSnapshot: a?.domSnapshot === true || a?.includeDOMSnapshot === true,
-                    som: a?.som === true || a?.withOverlay === true,
-                    tabs: a?.tabs === true,
-                    elements: a?.elements !== false,
-                });
-                if (!result) throw new Error("Received empty state");
-
-                taskMemory.recordSession({ title: result.title, url: result.url });
-
-                const content: any[] = [
-                    { type: "text", text: `Title: ${result.title}\nURL: ${result.url}` },
-                ];
-                if (result.screenshot) {
-                    content.push(imageContent(result.screenshot, "image/jpeg"));
-                }
-
-                return { content };
             }
 
             if (name === "browser_status") {
-                const result = await bridge.sendCommand("browser_status", { includeTargets: a?.includeTargets });
-                return { content: [{ type: "text", text: JSON.stringify(result) }] };
+                const status = await relayStatusSafe();
+                const browsers = await driver.listBrowsers().catch(() => []);
+                let activeTarget: unknown = null;
+                try {
+                    await sessions.load();
+                    const sessionId = sessionArg || sessions.currentId(caller);
+                    const record = sessions.get(sessionId);
+                    if (record?.target) {
+                        const targets = record.target.browserId
+                            ? await driver.listTargets(record.target.browserId).catch(() => [])
+                            : [];
+                        const match = targets.find((target) => target.targetId === record.target?.targetId);
+                        activeTarget = match
+                            ? { browserId: match.browserId, targetId: match.targetId, url: match.url, title: match.title }
+                            : { browserId: record.target.browserId, targetId: record.target.targetId, url: record.target.urlIncludes, stale: true };
+                    }
+                } catch {
+                    activeTarget = null;
+                }
+                return jsonToolResult({ ...status, browsers: browsers.length ? browsers : status.browsers, activeTarget }, {
+                    text: JSON.stringify({
+                        extensionConnected: status.extensionConnected,
+                        browsers: browsers.length ? browsers : status.browsers,
+                        agentTabs: status.agentTabs,
+                        activeTarget,
+                    }, null, 2),
+                });
             }
 
-            if (name === "snapshot_compact") {
-                const result = await bridge.sendCommand("snapshot_compact", {
-                    maxElements: a?.maxElements,
-                    includeText: a?.includeText
-                });
-                return { content: [{ type: "text", text: JSON.stringify(result) }] };
-            }
-
-            if (name === "list_interactive_elements") {
-                const result = await bridge.sendCommand("list_interactive_elements", {
-                    maxElements: a?.maxElements,
-                    withOverlay: a?.withOverlay
-                });
-                return { content: [{ type: "text", text: JSON.stringify(result) }] };
+            // ==================== ACTION ====================
+            if (name === "act") {
+                const { host, sessionId } = await resolveHost(caller, sessionArg);
+                const node = taskMemory.create(String(a.action ?? "act"), await host.url().catch(() => "unknown"), a.parentId);
+                try {
+                    const result = await runAct(host, a, sessionId);
+                    node.status = "success";
+                    return jsonWithImages(secretStore.redactDeep(result), true);
+                } catch (error: any) {
+                    node.status = "failure";
+                    node.error = error.message;
+                    throw error;
+                }
             }
 
             if (name === "click_by_ref") {
-                const result = await bridge.sendCommand("click_by_ref", { ref: a.ref });
-                return { content: [{ type: "text", text: JSON.stringify(result) }] };
+                const { host } = await resolveHost(caller, sessionArg);
+                const message = await host.click(String(a?.ref ?? ""));
+                return jsonToolResult({ success: true, ref: a?.ref, result: message }, { text: `${message}` });
             }
-
             if (name === "click_by_selector") {
-                const result = await bridge.sendCommand("click_by_selector", {
-                    selector: a.selector,
-                    timeout: a?.timeout
-                });
-                return { content: [{ type: "text", text: JSON.stringify(result) }] };
+                const { host } = await resolveHost(caller, sessionArg);
+                return jsonToolResult({ success: true, result: await host.click(String(a.selector)) });
             }
-
             if (name === "fill_by_selector") {
-                const result = await bridge.sendCommand("fill_by_selector", {
-                    selector: a.selector,
-                    value: a.value,
-                    timeout: a?.timeout
-                });
-                return { content: [{ type: "text", text: JSON.stringify(result) }] };
+                const { host } = await resolveHost(caller, sessionArg);
+                return jsonToolResult({ success: true, result: await host.fill(String(a.selector), a.value) });
             }
-
             if (name === "wait_for_selector") {
-                const result = await bridge.sendCommand("wait_for_selector", {
-                    selector: a.selector,
-                    timeout: a?.timeout
-                });
-                return { content: [{ type: "text", text: JSON.stringify(result) }] };
+                const { host } = await resolveHost(caller, sessionArg);
+                return jsonToolResult({ success: await host.waitForSelector(String(a.selector), Number(a?.timeout ?? 15_000)) });
             }
-
             if (name === "wait_for_text") {
-                const result = await bridge.sendCommand("wait_for_text", {
-                    text: a.text,
-                    timeout: a?.timeout
-                });
-                return { content: [{ type: "text", text: JSON.stringify(result) }] };
+                const { host } = await resolveHost(caller, sessionArg);
+                return jsonToolResult({ success: await host.waitForText(String(a.text), Number(a?.timeout ?? 15_000)) });
             }
-
-            if (name === "get_network_errors") {
-                const result = await bridge.sendCommand("get_network_errors", { limit: a?.limit });
-                return { content: [{ type: "text", text: JSON.stringify(result) }] };
-            }
-
-            if (name === "browser_intent") {
-                const result = await bridge.sendCommand("browser_intent", {
-                    intent: a.intent,
-                    target: a?.target,
-                    value: a?.value,
-                    role: a?.role,
-                    timeout: a?.timeout,
-                    verify: a?.verify,
-                    includeCandidates: a?.includeCandidates
-                });
-                return { content: [{ type: "text", text: JSON.stringify(result) }] };
-            }
-
-            if (name === "get_logs") {
-                const result = await bridge.sendCommand("get_logs", { limit: a?.limit });
-                return { content: [{ type: "text", text: JSON.stringify(result) }] };
-            }
-
-            if (name === "detect_captcha") {
-                const result = await bridge.sendCommand("detect_captcha", {});
-                return { content: [{ type: "text", text: JSON.stringify(result) }] };
-            }
-
-            if (name === "solve_captcha") {
-                const result = await bridge.sendCommand("solve_captcha", {
-                    useService:     a?.useService,
-                    service:        a?.service,
-                    apiKey:         a?.apiKey,
-                    pageUrl:        a?.pageUrl,
-                    waitAfterClick: a?.waitAfterClick,
-                    timeout:        a?.timeout,
-                    pollInterval:   a?.pollInterval,
-                });
-                return { content: [{ type: "text", text: JSON.stringify(result) }] };
-            }
-
-            if (name === "press_key") {
-                const result = await bridge.sendCommand("press_key", { key: a.key, modifiers: a?.modifiers });
-                return { content: [{ type: "text", text: JSON.stringify(result) }] };
-            }
-
-            if (name === "click_text") {
-                const result = await bridge.sendCommand("click_text", {
-                    text: a.text,
-                    role: a?.role,
-                    timeout: a?.timeout
-                });
-                return { content: [{ type: "text", text: JSON.stringify(result) }] };
-            }
-
-            if (name === "click_role") {
-                const result = await bridge.sendCommand("click_role", {
-                    role: a.role,
-                    name: a?.name,
-                    timeout: a?.timeout
-                });
-                return { content: [{ type: "text", text: JSON.stringify(result) }] };
-            }
-
-            if (name === "fill_label") {
-                const result = await bridge.sendCommand("fill_label", {
-                    label: a.label,
-                    value: a.value,
-                    role: a?.role,
-                    timeout: a?.timeout
-                });
-                return { content: [{ type: "text", text: JSON.stringify(result) }] };
-            }
-
-            if (name === "element_at_point") {
-                const result = await bridge.sendCommand("element_at_point", {
-                    x: a?.x,
-                    y: a?.y,
-                    coordinate: a?.coordinate
-                });
-                return { content: [{ type: "text", text: JSON.stringify(result) }] };
-            }
-
-            if (name === "execute_script") {
-                const result = await bridge.sendCommand("evaluate", { script: String(a?.script) });
-                // Scripts can return binary payloads (e.g. canvas.toDataURL()).
-                return resultWithImages(result, false);
-            }
-
-            if (name === "cdp_command") {
-                const result = await bridge.sendCommand("cdp_command", { command: a.command, args: a.args || {} });
-                // e.g. Page.captureScreenshot returns { data: "<base64>" }.
-                return jsonWithImages(result);
-            }
-
-            if (name === "act") {
-                const action = a.action;
-                let currentState = { url: "unknown" };
-                try {
-                    currentState = await bridge.sendCommand("get_state", {
-                        screenshot: false,
-                        domSnapshot: false,
-                        elements: false,
-                        som: false,
-                        tabs: false,
-                    });
-                } catch {}
-
-                const node = taskMemory.create(action, currentState.url, a.parentId);
-
-                let resultMsg = "";
-                const eid = a.elementId ? String(a.elementId).replace(/@/g, '') : undefined;
-                
-                try {
-                    if (action === "click") {
-                        try {
-                            if (eid) resultMsg = await bridge.sendCommand("click_element", { id: eid, text: a.value });
-                            else if (a.selector) resultMsg = await bridge.sendCommand("click_element_by_selector", { selector: a.selector });
-                            else if (a.coordinate) {
-                                const [x, y] = String(a.coordinate).split(',').map(Number);
-                                resultMsg = await bridge.sendCommand("click", { x, y });
-                            } else {
-                                resultMsg = await bridge.sendCommand(action, a);
-                            }
-                        } catch (err) {
-                            // SELF-HEALING: Try fuzzy match if exact failed
-                            console.error(`[Aether] Action failed, attempting self-healing...`);
-                            const resolved = await bridge.resolveSelector({ 
-                                originalSelector: a.selector, 
-                                text: a.value || a.text 
-                            }).catch(() => null);
-                            
-                            if (resolved) {
-                                console.error(`[Aether] Self-healing resolved to: ${resolved.selector} (${resolved.method})`);
-                                resultMsg = await bridge.sendCommand("click_element_by_selector", { selector: resolved.selector });
-                                if (aetherMemory.canWrite(a?.projectRoot)) {
-                                    await aetherMemory.rememberLesson({
-                                        projectRoot: a?.projectRoot,
-                                        title: "Recover from brittle click selector",
-                                        trigger: "When a click fails because the exact selector or text no longer matches, but a nearby semantic element can be resolved.",
-                                        problemPattern: "A brittle click selector failed during browser automation.",
-                                        symptoms: ["click_element_by_selector threw", "selector self-healing found a replacement"],
-                                        failedApproach: a.selector || a.value || a.text || "original click target",
-                                        betterApproach: `Use resolved selector "${resolved.selector}" from ${resolved.method} after checking visible interactive candidates.`,
-                                        createdBecause: "errors_overcome",
-                                        evidence: `Recovered ${action} on ${currentState.url}. Confidence: ${resolved.confidence}.`,
-                                        tags: ["selector", "click", "self-healing"],
-                                        confidence: resolved.confidence || 0.72,
-                                    }).catch((memoryError) => console.error("[Aether] Failed to remember click recovery:", memoryError));
-                                }
-                            } else {
-                                throw err;
-                            }
-                        }
-                    } else if (action === "type") {
-                        try {
-                            if (eid || a.selector) await bridge.sendCommand(eid ? "click_element" : "click_element_by_selector", { id: eid, selector: a.selector });
-                            resultMsg = await bridge.sendCommand("type", { text: a.value || a.text });
-                        } catch (err) {
-                            // SELF-HEALING
-                            const resolved = await bridge.resolveSelector({ 
-                                originalSelector: a.selector, 
-                                text: a.value || a.text 
-                            }).catch(() => null);
-                            
-                            if (resolved) {
-                                await bridge.sendCommand("click_element_by_selector", { selector: resolved.selector });
-                                resultMsg = await bridge.sendCommand("type", { text: a.value || a.text });
-                                if (aetherMemory.canWrite(a?.projectRoot)) {
-                                    await aetherMemory.rememberLesson({
-                                        projectRoot: a?.projectRoot,
-                                        title: "Recover from brittle typing target",
-                                        trigger: "When typing fails because the original input selector no longer resolves, but a semantic replacement can be found.",
-                                        problemPattern: "A brittle typing selector failed during browser automation.",
-                                        symptoms: ["typing target could not be focused", "selector self-healing found a replacement"],
-                                        failedApproach: a.selector || "original typing target",
-                                        betterApproach: `Focus resolved selector "${resolved.selector}" from ${resolved.method}, then type with native input events.`,
-                                        createdBecause: "errors_overcome",
-                                        evidence: `Recovered ${action} on ${currentState.url}. Confidence: ${resolved.confidence}.`,
-                                        tags: ["selector", "typing", "self-healing"],
-                                        confidence: resolved.confidence || 0.72,
-                                    }).catch((memoryError) => console.error("[Aether] Failed to remember typing recovery:", memoryError));
-                                }
-                            } else {
-                                throw err;
-                            }
-                        }
-                    } else if (action === "navigate") {
-                        resultMsg = await bridge.sendCommand("navigate", { url: a.value });
-                    } else {
-                        resultMsg = await bridge.sendCommand(action, a);
-                    }
-                    node.status = 'success';
-                } catch (err: any) {
-                    node.status = 'failure';
-                    node.error = err.message;
-                    throw err;
-                }
-
-                // May be a bare base64 screenshot/PDF string or a structured
-                // payload; resultWithImages lifts binary payloads out of text.
-                return resultWithImages(resultMsg, false);
-            }
-
-            // ==================== AGENT-CENTRIC APIs ====================
-            if (name === "agent_action") {
-                const result = await bridge.sendCommand("agent_action", {
-                    action: a.action,
-                    target: a.target,
-                    verify: a.verify,
-                    waitFor: a.waitFor,
-                    timeout: a.timeout,
-                    screenshot: a.screenshot === true
-                });
-                return jsonWithImages(result);
-            }
-
             if (name === "smart_navigate") {
-                const result = await bridge.sendCommand("smart_navigate", {
-                    url: a.url,
-                    waitFor: a.waitFor,
-                    dismissPopups: a.dismissPopups,
-                    screenshot: a.screenshot,
-                    timeout: a.timeout
-                });
-                return jsonWithImages(result);
+                const { host } = await resolveHost(caller, sessionArg);
+                await host.navigate(String(a.url));
+                const result: any = { success: true, url: await host.url(), title: await host.title() };
+                if (a.screenshot) result.screenshot = (await host.screenshot({})).base64 ?? null;
+                return jsonWithImages(secretStore.redactDeep(result));
             }
-
+            if (name === "browser_intent") {
+                const { host, sessionId } = await resolveHost(caller, sessionArg);
+                return jsonWithImages(secretStore.redactDeep(await runAct(host, { ...a, action: "intent" }, sessionId)));
+            }
+            if (name === "agent_action") {
+                const { host, sessionId } = await resolveHost(caller, sessionArg);
+                return jsonWithImages(secretStore.redactDeep(await runAct(host, { ...a, action: "agent_action", agentAction: a.action }, sessionId)));
+            }
             if (name === "observe_and_act") {
-                const result = await bridge.sendCommand("observe_and_act", {
-                    action: a.action,
-                    observe: a.observe,
-                    returnScreenshot: a.returnScreenshot
-                });
-                return jsonWithImages(result);
+                const { host, sessionId } = await resolveHost(caller, sessionArg);
+                return jsonWithImages(secretStore.redactDeep(await runAct(host, { ...a, action: "observe_and_act", agentAction: a.action }, sessionId)));
             }
-
             if (name === "agent_form_fill") {
-                const result = await bridge.sendCommand("agent_form_fill", {
-                    fields: a.fields,
-                    submitAfterFill: a.submitAfterFill,
-                    submitSelector: a.submitSelector
-                });
-                return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
+                const { host, sessionId } = await resolveHost(caller, sessionArg);
+                return jsonWithImages(secretStore.redactDeep(await runAct(host, { ...a, action: "form_fill" }, sessionId)));
+            }
+            if (name === "sample_visual_frames") {
+                const { host, sessionId } = await resolveHost(caller, sessionArg);
+                const result = await runAct(host, { ...a, action: "sample_visual_frames" }, sessionId);
+                return jsonWithImages(secretStore.redactDeep(result), true);
             }
 
-            if (name === "page_snapshot") {
-                const result = await bridge.sendCommand("page_snapshot", {
-                    fullPage: a.fullPage,
-                    includeDOMSnapshot: a.includeDOMSnapshot,
-                    screenshot: a.screenshot === true,
-                    cookies: a.cookies === true,
-                    accessibilityTree: a.accessibilityTree === true
+            // ==================== DIAGNOSTICS ====================
+            if (name === "get_logs") {
+                const { host } = await resolveHost(caller, sessionArg);
+                return jsonToolResult({ logs: host.consoleLogs(Number(a?.limit ?? 50)) });
+            }
+            if (name === "get_network_errors") {
+                const { host } = await resolveHost(caller, sessionArg);
+                return jsonToolResult({ requests: host.networkErrors(Number(a?.limit ?? 20)) });
+            }
+            if (name === "har_start") {
+                const { host } = await resolveHost(caller, sessionArg);
+                const status = await host.startNetworkCapture();
+                return jsonToolResult({ ...status, path: a?.path ?? null }, {
+                    text: `HAR capture started (${status.entries} entries so far). Stop it with diagnostics {action:"har_stop"}${a?.path ? ` and it will be written to ${a.path}` : ""}.`,
                 });
-                
-                const content: any[] = [
-                    { type: "text", text: `Title: ${result.title}\nURL: ${result.url}` }
-                ];
-                if (result.screenshot) {
-                    content.push(imageContent(result.screenshot, "image/jpeg"));
-                }
-                if (result.elements) {
-                    content.push({ type: "text", text: `\nInteractive Elements: ${JSON.stringify(result.elements, null, 2)}` });
-                }
-                return { content };
+            }
+            if (name === "har_stop") {
+                const { host } = await resolveHost(caller, sessionArg);
+                const result = await host.stopNetworkCapture(a?.path ? String(a.path) : undefined);
+                return jsonToolResult(result, {
+                    text: `HAR capture stopped after ${result.entries} entries${result.path ? `; written to ${result.path}` : ""}.`,
+                });
+            }
+            if (name === "har_status") {
+                const { host } = await resolveHost(caller, sessionArg);
+                return jsonToolResult({ ...host.networkCaptureStatus(), entries: host.networkTraffic(Number(a?.limit ?? 20)) });
             }
 
+            if (name === "secrets") {
+                const store = getSecretStore();
+                await store.load();
+                const action = String(a?.action ?? "list");
+
+                if (action === "list") {
+                    return jsonToolResult({ profiles: await store.list() });
+                }
+                if (action === "status") {
+                    return jsonToolResult(await store.status(String(a?.name ?? "")));
+                }
+                if (action === "set" || action === "add") {
+                    const values: Record<string, string> =
+                        a?.values && typeof a.values === "object"
+                            ? a.values
+                            : a?.key
+                              ? { [String(a.key)]: String(a.value ?? "") }
+                              : {};
+                    const profile = await store.set(String(a?.name ?? ""), values, Array.isArray(a?.origins) ? a.origins : []);
+                    return jsonToolResult({ ...profile, stored: true }, {
+                        text: `Stored secret profile '${profile.name}' with keys: ${profile.keys.join(", ")}. Values are never returned.`,
+                    });
+                }
+                if (action === "remove" || action === "delete") {
+                    const removed = await store.remove(String(a?.name ?? ""));
+                    return jsonToolResult({ removed });
+                }
+                if (action === "type") {
+                    const profile = await store.get(String(a?.name ?? ""));
+                    if (!profile) throw new Error(`No secret profile named '${a?.name}'. Create it with secrets {action:"set"}.`);
+                    const key = String(a?.secretKey ?? Object.keys(profile.values)[0] ?? "");
+                    const value = profile.values[key];
+                    if (!value) throw new Error(`Profile '${profile.name}' has no secret '${key}'.`);
+                    const { host } = await resolveHost(caller, sessionArg);
+                    const target = a?.selector ?? a?.label ?? a?.ref;
+                    if (!target) throw new Error("secrets type needs a selector, label, or ref for the field.");
+                    await host.fill(String(target), value);
+                    return jsonToolResult({ typed: true, name: profile.name, key, origins: profile.origins }, {
+                        text: `Typed secret '${key}' from '${profile.name}'. Its value was not returned.`,
+                    });
+                }
+                if (action === "run") {
+                    const result = await store.run(
+                        String(a?.name ?? ""),
+                        String(a?.command ?? ""),
+                        Array.isArray(a?.args) ? a.args.map(String) : [],
+                        Number(a?.timeoutMs ?? 60_000)
+                    );
+                    return jsonToolResult(result);
+                }
+                throw new Error(`Unknown secrets action: ${action}`);
+            }
+            if (name === "get_performance_metrics") {
+                const { host } = await resolveHost(caller, sessionArg);
+                const cdp = await withCdp(host);
+                await cdp("Performance.enable");
+                return jsonToolResult(await cdp("Performance.getMetrics"));
+            }
+
+            // ==================== PAGE TEXT ====================
             if (name === "get_page_text") {
-                const result = await bridge.sendCommand("get_page_text", {
-                    format: a?.format,
-                    selector: a?.selector,
-                    includeLinks: a?.includeLinks,
-                    maxLength: a?.maxLength,
+                const { host } = await resolveHost(caller, sessionArg);
+                const result = await host.evaluate((arg: any) => {
+                    const root = arg.selector ? document.querySelector(arg.selector) : document.body;
+                    const title = document.title;
+                    const url = location.href;
+                    if (!root) return { title, url, text: "" };
+                    const text = (root as HTMLElement).innerText || root.textContent || "";
+                    return { title, url, text };
+                }, { selector: a?.selector });
+                const payload = result as { title: string; url: string; text: string };
+                const maxLength = Number(a?.maxLength ?? 20_000);
+                const text = secretStore.redact(payload.text.slice(0, maxLength));
+                const truncated = payload.text.length > maxLength;
+                return jsonToolResult({ ...payload, title: secretStore.redact(payload.title), text, truncated, length: text.length }, {
+                    text: `Title: ${secretStore.redact(payload.title)}\nURL: ${payload.url}\nFormat: ${a?.format ?? "text"} | ${text.length} chars${truncated ? " (truncated)" : ""}\n\n${text}`,
                 });
-                const header = `Title: ${result.title}\nURL: ${result.url}\nFormat: ${result.format} | ${result.length} chars${result.truncated ? " (truncated)" : ""}`;
-                return { content: [{ type: "text", text: `${header}\n\n${result.text}` }] };
             }
 
-            if (name === "save_auth_state") {
-                const result = await bridge.sendCommand("save_auth_state", {
-                    path: a?.path,
-                    origins: a?.origins,
+            // ==================== CAPTCHA ====================
+            if (name === "detect_captcha") {
+                const { host, sessionId } = await resolveHost(caller, sessionArg);
+                return jsonToolResult(await runAct(host, { action: "detect_captcha" }, sessionId));
+            }
+            if (name === "solve_captcha") {
+                const { host } = await resolveHost(caller, sessionArg);
+                const evaluate = (script: string) => host.page.evaluate(script);
+                const sendCommand = async (method: string, params: any) => {
+                    assertCdpAllowed(method);
+                    const session = await host.rawCdp();
+                    return await session.send(method as any, params);
+                };
+                const result = await detectAndSolve(evaluate as any, sendCommand, await host.url(), { x: 200, y: 200 }, {
+                    useService: a?.useService,
+                    service: a?.service,
+                    apiKey: a?.apiKey,
+                    waitAfterClick: a?.waitAfterClick,
+                    timeout: a?.timeout,
+                    pollInterval: a?.pollInterval,
                 });
-                return { content: [{ type: "text", text: JSON.stringify(result) }] };
+                return jsonToolResult(result);
             }
 
-            if (name === "load_auth_state") {
-                const result = await bridge.sendCommand("load_auth_state", {
-                    path: a?.path,
-                    reload: a?.reload,
-                });
-                return { content: [{ type: "text", text: JSON.stringify(result) }] };
+            // ==================== CDP ====================
+            if (name === "cdp_command") {
+                const { host } = await resolveHost(caller, sessionArg);
+                assertCdpAllowed(String(a.command));
+                const session = await host.rawCdp();
+                const result = await session.send(String(a.command) as any, (a.args ?? {}) as any);
+                return jsonWithImages(secretStore.redactDeep(result));
             }
 
             throw new Error(`Unknown tool: ${name}`);
         } catch (error: any) {
-            if (error.captcha) {
-                return toolError(error);
-            }
-            if (error.message?.includes("not connected") || error.message?.includes("CDP not connected")) {
-                return toolError(error);
-            }
             return toolError(error);
         }
     });
 }
-
