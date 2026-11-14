@@ -24,6 +24,7 @@ function makeHost(tabs: CdpTab[]): BrowserHost & { sentToTab: Array<{ tabId: num
             return { ok: true, tabId, method };
         },
         isOwned: () => true,
+        frameId: async (tabId: number) => (tabId === 3 ? "FRAME-3" : null),
     };
 }
 
@@ -113,4 +114,42 @@ test("attached target info carries the browser context Playwright requires", asy
     await connection.handle({ id: 1, method: "Target.attachToTarget", params: { targetId: "chrome-1:3", flatten: true } });
     const attached = events.find((event) => event.method === "Target.attachedToTarget");
     assert.equal(attached.params.targetInfo.browserContextId, "aether-chrome-1");
+});
+
+test("attachToTarget mints its own session, so detaching it keeps the page", async () => {
+    const tabs: CdpTab[] = [{ tabId: 7, url: "https://example.com", title: "Example", active: true }];
+    const host = makeHost(tabs);
+    const events: any[] = [];
+    const connection = new BrowserCdpConnection("chrome-1", host, { send: (message) => events.push(message) });
+
+    const first: any = await connection.handle({ id: 1, method: "Target.attachToTarget", params: { targetId: "chrome-1:7", flatten: true } });
+    const second: any = await connection.handle({ id: 2, method: "Target.attachToTarget", params: { targetId: "chrome-1:7", flatten: true } });
+    assert.notEqual(first.sessionId, second.sessionId);
+
+    await connection.handle({ id: 3, method: "Target.detachFromTarget", params: { sessionId: second.sessionId } });
+    assert.equal(connection.sessionForTab(7), first.sessionId);
+    const result = await connection.handle({ id: 4, method: "Runtime.evaluate", params: {}, sessionId: first.sessionId });
+    assert.deepEqual(result, { ok: true, tabId: 7, method: "Runtime.evaluate" });
+});
+
+test("a browser session attaches a target without disturbing the page sessions", async () => {
+    const tabs: CdpTab[] = [{ tabId: 3, url: "https://example.com", title: "Example", active: true }];
+    const events: any[] = [];
+    const connection = new BrowserCdpConnection("chrome-1", makeHost(tabs), { send: (message) => events.push(message) });
+
+    const browser: any = await connection.handle({ id: 1, method: "Target.attachToBrowserTarget", params: {} });
+    assert.match(browser.sessionId, /^aether-browser-/);
+
+    const attached: any = await connection.handle({
+        id: 2,
+        method: "Target.attachToTarget",
+        params: { targetId: "FRAME-3", flatten: true },
+        sessionId: browser.sessionId,
+    });
+    const event = events.find((entry) => entry.method === "Target.attachedToTarget");
+    assert.equal(event.sessionId, browser.sessionId);
+    assert.equal(event.params.targetInfo.targetId, "FRAME-3");
+
+    const info: any = await connection.handle({ id: 3, method: "Target.getTargetInfo", params: {}, sessionId: attached.sessionId });
+    assert.equal(info.targetInfo.targetId, "FRAME-3");
 });

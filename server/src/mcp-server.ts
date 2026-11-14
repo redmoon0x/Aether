@@ -105,7 +105,7 @@ async function resolveHost(
         if (browserId) {
             const relayTab = await getExtensionRelay().ensureAgentTabAnywhere(browserId, sessionId).catch(() => null);
             if (relayTab) {
-                pin = { browserId: relayTab.browserId, targetId: `${relayTab.browserId}:${relayTab.tabId}` };
+                pin = { browserId: relayTab.browserId, targetId: relayTab.targetId };
                 await sessions.bind(sessionId, pin, caller);
             }
         }
@@ -119,7 +119,7 @@ async function resolveHost(
             if (relayTab) {
                 await sessions.bind(
                     sessionId,
-                    { browserId: relayTab.browserId, targetId: `${relayTab.browserId}:${relayTab.tabId}` },
+                    { browserId: relayTab.browserId, targetId: relayTab.targetId },
                     caller
                 );
             } else {
@@ -692,7 +692,7 @@ export function RegisterMcpTools(server: Server) {
                 if (browserId) {
                     const relayTab = await getExtensionRelay().ensureAgentTabAnywhere(browserId, record.id).catch(() => null);
                     if (relayTab) {
-                        await sessions.bind(record.id, { browserId: relayTab.browserId, targetId: `${relayTab.browserId}:${relayTab.tabId}` }, caller);
+                        await sessions.bind(record.id, { browserId: relayTab.browserId, targetId: relayTab.targetId }, caller);
                     } else {
                         const resolved = await driver.ensurePage(browserId).catch(() => null);
                         if (resolved) {
@@ -881,7 +881,7 @@ export function RegisterMcpTools(server: Server) {
                 // the relay's browser endpoint to create a page instead.
                 if (!relayTab) {
                     const ensured = await driver.ensurePage(browserId).catch(() => null);
-                    if (ensured) relayTab = { browserId, tabId: Number(ensured.targetId?.split(":").pop() ?? 0) };
+                    if (ensured) relayTab = { browserId, tabId: Number(ensured.targetId?.split(":").pop() ?? 0), targetId: ensured.targetId ?? "" };
                 }
                 const tabs = await driver.listTargets(browserId).catch(() => []);
 

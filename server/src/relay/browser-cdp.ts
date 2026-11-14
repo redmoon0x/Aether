@@ -29,6 +29,11 @@ export interface BrowserHost {
     group(tabId: number, sessionId: string): Promise<void>;
     send(tabId: number, method: string, params: any): Promise<any>;
     isOwned(tabId: number): boolean;
+    /**
+     * The tab's main frame id. Chrome uses it as the page target id, and
+     * Playwright maps frames back to sessions through that id.
+     */
+    frameId(tabId: number): Promise<string | null>;
 }
 
 export interface BrowserCdpSink {
@@ -43,7 +48,12 @@ interface SessionRecord {
 
 export class BrowserCdpConnection {
     private readonly sessions = new Map<string, SessionRecord>();
-    private readonly byTab = new Map<number, string>();
+    /** Every session attached to a tab; Chrome allows more than one. */
+    private readonly byTab = new Map<number, Set<string>>();
+    private readonly primaryByTab = new Map<number, string>();
+    private readonly frameIds = new Map<number, string>();
+    private readonly tabsByFrame = new Map<string, number>();
+    private readonly browserSessions = new Set<string>();
     private nextSession = 1;
     private discover = false;
     private autoAttach = false;
@@ -55,10 +65,36 @@ export class BrowserCdpConnection {
     ) {}
 
     private targetId(tabId: number): string {
-        return `${this.browserId}:${tabId}`;
+        return this.frameIds.get(tabId) ?? `${this.browserId}:${tabId}`;
+    }
+
+    /** Learn the tab's main frame id, which is the id Chrome reports as its target. */
+    private async identify(tabId: number): Promise<string | null> {
+        const known = this.frameIds.get(tabId);
+        if (known) return known;
+        const frameId = await this.host.frameId(tabId).catch(() => null);
+        if (!frameId) return null;
+        this.frameIds.set(tabId, frameId);
+        this.tabsByFrame.set(frameId, tabId);
+        return frameId;
+    }
+
+    /** Resolve a target id, learning frame ids of owned tabs if needed. */
+    private async resolveTarget(targetId: string): Promise<number | null> {
+        const known = this.tabIdFromTarget(targetId);
+        if (known !== null) return known;
+        for (const tab of await this.host.listTabs()) {
+            if (this.frameIds.has(tab.tabId)) continue;
+            await this.identify(tab.tabId);
+            const mapped = this.tabsByFrame.get(targetId);
+            if (mapped !== undefined) return mapped;
+        }
+        return this.tabIdFromTarget(targetId);
     }
 
     private tabIdFromTarget(targetId: string): number | null {
+        const known = this.tabsByFrame.get(targetId);
+        if (known !== undefined) return known;
         if (!targetId.startsWith(`${this.browserId}:`)) return null;
         const id = Number(targetId.slice(this.browserId.length + 1));
         return Number.isFinite(id) ? id : null;
@@ -86,68 +122,124 @@ export class BrowserCdpConnection {
     }
 
     onTabClosed(tabId: number): void {
-        const sessionId = this.byTab.get(tabId);
-        if (sessionId) {
+        const targetId = this.targetId(tabId);
+        for (const sessionId of this.byTab.get(tabId) ?? []) {
             this.sessions.delete(sessionId);
-            this.byTab.delete(tabId);
-            this.sink.send({ method: "Target.detachedFromTarget", params: { sessionId, targetId: this.targetId(tabId) } });
+            this.sink.send({ method: "Target.detachedFromTarget", params: { sessionId, targetId } });
         }
-        if (this.discover) this.sink.send({ method: "Target.targetDestroyed", params: { targetId: this.targetId(tabId) } });
+        this.byTab.delete(tabId);
+        this.primaryByTab.delete(tabId);
+        if (this.discover) this.sink.send({ method: "Target.targetDestroyed", params: { targetId } });
+        const frameId = this.frameIds.get(tabId);
+        if (frameId) this.tabsByFrame.delete(frameId);
+        this.frameIds.delete(tabId);
     }
 
     onTabUpdated(tab: CdpTab): void {
         if (this.discover) this.sink.send({ method: "Target.targetInfoChanged", params: { targetInfo: this.targetInfo(tab) } });
     }
 
-    /** Forward a page event to the session that owns the tab. */
-    onEvent(tabId: number, method: string, params: any): void {
-        const sessionId = this.byTab.get(tabId);
-        if (!sessionId) return;
-        this.sink.send({ method, params, sessionId });
-    }
-
-    private async attachInternal(tabId: number): Promise<string> {
+    private sessionsOf(tabId: number): Set<string> {
         const existing = this.byTab.get(tabId);
         if (existing) return existing;
+        const created = new Set<string>();
+        this.byTab.set(tabId, created);
+        return created;
+    }
+
+    /** Forward a page event to every session attached to the tab. */
+    onEvent(tabId: number, method: string, params: any): void {
+        for (const sessionId of this.byTab.get(tabId) ?? []) {
+            this.sink.send({ method, params, sessionId });
+        }
+    }
+
+    /**
+     * Attach a tab and return the new session id.
+     *
+     * `fresh` mints a session even when the tab is already attached: Chrome
+     * allows several sessions per target and Playwright's `newCDPSession`
+     * relies on getting its own. Collapsing them made detaching that extra
+     * session tear the page down. A session-scoped attach reports
+     * `attachedToTarget` inside the requesting session, not at the root.
+     */
+    private async attachInternal(tabId: number, options: { fresh?: boolean; notify?: string } = {}): Promise<string> {
+        const sessions = this.sessionsOf(tabId);
+        const primary = this.primaryByTab.get(tabId);
+        if (!options.fresh && primary && sessions.has(primary)) return primary;
 
         await this.host.attach(tabId);
         const tabs = await this.host.listTabs();
         const tab = tabs.find((candidate) => candidate.tabId === tabId);
         if (!tab) throw new Error(`Tab ${tabId} is no longer open.`);
+        // Chrome reports the page target as its main frame; Playwright needs
+        // that to map the frame it gets from Page.getFrameTree back to us.
+        await this.identify(tabId);
 
         const sessionId = `aether-${this.nextSession++}`;
-        const record = { sessionId, tabId, targetId: this.targetId(tabId) };
-        this.sessions.set(sessionId, record);
-        this.byTab.set(tabId, sessionId);
+        this.sessions.set(sessionId, { sessionId, tabId, targetId: this.targetId(tabId) });
+        sessions.add(sessionId);
+        if (!primary) this.primaryByTab.set(tabId, sessionId);
 
-        this.sink.send({
+        const payload = {
             method: "Target.attachedToTarget",
             params: {
                 sessionId,
                 targetInfo: { ...this.targetInfo(tab), attached: true },
                 waitingForDebugger: false,
             },
-        });
+        };
+        this.sink.send(options.notify ? { ...payload, sessionId: options.notify } : payload);
         return sessionId;
     }
 
-    private async detachInternal(sessionId: string): Promise<void> {
+    private async detachInternal(sessionId: string, notify?: string): Promise<void> {
         const record = this.sessions.get(sessionId);
         if (!record) return;
         this.sessions.delete(sessionId);
-        if (this.byTab.get(record.tabId) === sessionId) this.byTab.delete(record.tabId);
+        const sessions = this.byTab.get(record.tabId);
+        if (sessions) {
+            sessions.delete(sessionId);
+            if (this.primaryByTab.get(record.tabId) === sessionId) {
+                const next = sessions.values().next();
+                if (next.done) this.primaryByTab.delete(record.tabId);
+                else this.primaryByTab.set(record.tabId, next.value);
+            }
+        }
         // Keep the chrome.debugger attachment: another CDP session (or a
         // reconnect) may still drive this tab. Only the logical session ends.
-        this.sink.send({
-            method: "Target.detachedFromTarget",
-            params: { sessionId, targetId: record.targetId },
-        });
+        const payload = { method: "Target.detachedFromTarget", params: { sessionId, targetId: record.targetId } };
+        this.sink.send(notify ? { ...payload, sessionId: notify } : payload);
     }
 
     async handle(message: { id: number; method: string; params?: any; sessionId?: string }): Promise<any> {
         const params = message.params ?? {};
 
         if (message.sessionId) {
+            if (this.browserSessions.has(message.sessionId)) {
+                // A browser-level session carries Target commands; everything
+                // else belongs to a page, which has its own session.
+                if (message.method === "Target.detachFromTarget") {
+                    if (params.sessionId === message.sessionId) {
+                        this.browserSessions.delete(message.sessionId);
+                        return {};
+                    }
+                    if (typeof params.sessionId === "string") {
+                        // Report the detach inside the session that asked for it,
+                        // the way Chrome does, so the root page map is untouched.
+                        await this.detachInternal(params.sessionId, message.sessionId);
+                    }
+                    return {};
+                }
+                if (message.method === "Target.attachToTarget") {
+                    if (params.flatten === false) throw new Error("Aether only supports flattened CDP sessions.");
+                    const sessionTab = await this.resolveTarget(String(params.targetId ?? ""));
+                    if (sessionTab === null) throw new Error(`Unknown target: ${params.targetId}`);
+                    const attached = await this.attachInternal(sessionTab, { fresh: true, notify: message.sessionId });
+                    return { sessionId: attached };
+                }
+                return await this.handle({ id: message.id, method: message.method, params });
+            }
             return await this.handleSessionCommand(message.sessionId, message.method, params);
         }
 
@@ -185,9 +277,9 @@ export class BrowserCdpConnection {
 
             case "Target.attachToTarget": {
                 if (params.flatten === false) throw new Error("Aether only supports flattened CDP sessions.");
-                const tabId = this.tabIdFromTarget(String(params.targetId ?? ""));
+                const tabId = await this.resolveTarget(String(params.targetId ?? ""));
                 if (tabId === null) throw new Error(`Unknown target: ${params.targetId}`);
-                const sessionId = await this.attachInternal(tabId);
+                const sessionId = await this.attachInternal(tabId, { fresh: true });
                 return { sessionId };
             }
 
@@ -228,8 +320,16 @@ export class BrowserCdpConnection {
             case "Target.getBrowserContexts":
                 return { browserContextIds: [] };
 
+            // Playwright's `newCDPSession` routes through a browser session.
+            case "Target.attachToBrowserTarget": {
+                const sessionId = `aether-browser-${this.nextSession++}`;
+                this.browserSessions.add(sessionId);
+                return { sessionId };
+            }
+
             case "Target.createTarget": {
                 const tab = await this.host.createTab(String(params.url ?? "about:blank"), "agent");
+                await this.identify(tab.tabId);
                 if (this.discover) {
                     this.sink.send({ method: "Target.targetCreated", params: { targetInfo: this.targetInfo(tab) } });
                 }
@@ -238,7 +338,7 @@ export class BrowserCdpConnection {
             }
 
             case "Target.closeTarget": {
-                const tabId = this.tabIdFromTarget(String(params.targetId ?? ""));
+                const tabId = await this.resolveTarget(String(params.targetId ?? ""));
                 if (tabId === null || !this.host.isOwned(tabId)) {
                     throw new Error("Aether can only close tabs it opened.");
                 }
@@ -302,8 +402,8 @@ export class BrowserCdpConnection {
         return await this.host.send(record.tabId, method, params);
     }
 
-    /** Session id currently attached to a tab, if any. */
+    /** The primary session id attached to a tab, if any. */
     sessionForTab(tabId: number): string | undefined {
-        return this.byTab.get(tabId);
+        return this.primaryByTab.get(tabId);
     }
 }

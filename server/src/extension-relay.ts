@@ -384,7 +384,8 @@ export class ExtensionRelay {
             try {
                 await this.refreshTabs(link);
                 const tabId = await this.ensureAgentTab(link, url.searchParams.get("session") || "agent");
-                json({ tabId, browserId: link.id });
+                const targetId = (await this.tabFrameId(link, tabId)) ?? `${link.id}:${tabId}`;
+                json({ tabId, browserId: link.id, targetId });
             } catch (error: any) {
                 response.writeHead(503, { "content-type": "application/json" });
                 response.end(JSON.stringify({ error: String(error?.message ?? error) }));
@@ -740,13 +741,32 @@ export class ExtensionRelay {
         return tabId;
     }
 
+    /** A tab's main frame id, which is the CDP target id Chrome would report. */
+    async tabFrameId(link: ExtensionLink, tabId: number): Promise<string | null> {
+        try {
+            const result = await this.sendTab(link, tabId, "Page.getFrameTree", {});
+            if (!result || typeof result !== "object" || !("frameTree" in result)) return null;
+            const tree = result.frameTree;
+            if (!tree || typeof tree !== "object" || !("frame" in tree)) return null;
+            const frame = tree.frame;
+            if (!frame || typeof frame !== "object" || !("id" in frame)) return null;
+            return typeof frame.id === "string" && frame.id ? frame.id : null;
+        } catch {
+            return null;
+        }
+    }
+
     /** Ensure an agent tab for a browser id (or the default browser). */
-    async ensureAgentTabFor(browserId: string | undefined, sessionId: string): Promise<{ browserId: string; tabId: number } | null> {
+    async ensureAgentTabFor(
+        browserId: string | undefined,
+        sessionId: string
+    ): Promise<{ browserId: string; tabId: number; targetId: string } | null> {
         const link = this.resolveLink(browserId);
         if (!link) return null;
         await this.refreshTabs(link);
         const tabId = await this.ensureAgentTab(link, sessionId);
-        return { browserId: link.id, tabId };
+        const targetId = (await this.tabFrameId(link, tabId)) ?? `${link.id}:${tabId}`;
+        return { browserId: link.id, tabId, targetId };
     }
 
     /**
@@ -759,7 +779,7 @@ export class ExtensionRelay {
     async ensureAgentTabAnywhere(
         browserId: string | undefined,
         sessionId: string
-    ): Promise<{ browserId: string; tabId: number } | null> {
+    ): Promise<{ browserId: string; tabId: number; targetId: string } | null> {
         if (this.running && this.resolveLink(browserId)) {
             return await this.ensureAgentTabFor(browserId, sessionId);
         }
@@ -775,7 +795,11 @@ export class ExtensionRelay {
             const tabId = "tabId" in body ? Number(body.tabId) : Number.NaN;
             if (!Number.isFinite(tabId)) return null;
             const answered = "browserId" in body && typeof body.browserId === "string" ? body.browserId : "";
-            return { browserId: answered || String(browserId ?? ""), tabId };
+            const targetId =
+                "targetId" in body && typeof body.targetId === "string" && body.targetId
+                    ? body.targetId
+                    : `${answered || browserId}:${tabId}`;
+            return { browserId: answered || String(browserId ?? ""), tabId, targetId };
         } catch {
             return null;
         }
@@ -842,6 +866,7 @@ export class ExtensionRelay {
                 return await this.sendTab(link, tabId, method, params);
             },
             isOwned: (tabId) => link.owned.has(tabId),
+            frameId: (tabId) => this.tabFrameId(link, tabId),
         };
 
         const connection = new BrowserCdpConnection(link.id, host, {
