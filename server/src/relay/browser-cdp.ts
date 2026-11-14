@@ -73,6 +73,9 @@ export class BrowserCdpConnection {
             url: tab.url || "about:blank",
             attached: this.byTab.has(tab.tabId),
             canAccessOpener: false,
+            // Playwright asserts on this while handling attachedToTarget; every
+            // extension tab belongs to the single context of its browser.
+            browserContextId: `aether-${this.browserId}`,
         };
     }
 
@@ -189,7 +192,8 @@ export class BrowserCdpConnection {
             }
 
             case "Target.detachFromTarget": {
-                const sessionId = params.sessionId ?? this.byTab.get(Number(params.targetId));
+                const tabId = params.targetId ? this.tabIdFromTarget(String(params.targetId)) : null;
+                const sessionId = params.sessionId ?? (tabId === null ? undefined : this.byTab.get(tabId));
                 if (sessionId) await this.detachInternal(String(sessionId));
                 return {};
             }
@@ -200,9 +204,23 @@ export class BrowserCdpConnection {
             }
 
             case "Target.getTargetInfo": {
-                const tabId = params.targetId ? this.tabIdFromTarget(String(params.targetId)) : null;
+                // No targetId asks for the browser target itself. Playwright
+                // sends this on connect — including to a browser that has no
+                // page yet — so it must never fail on an empty target list.
+                if (!params.targetId) {
+                    return {
+                        targetInfo: {
+                            targetId: this.browserId,
+                            type: "browser",
+                            title: "",
+                            url: "",
+                            attached: true,
+                        },
+                    };
+                }
+                const tabId = this.tabIdFromTarget(String(params.targetId));
                 const tabs = await this.host.listTabs();
-                const tab = tabId === null ? tabs[0] : tabs.find((candidate) => candidate.tabId === tabId);
+                const tab = tabId === null ? undefined : tabs.find((candidate) => candidate.tabId === tabId);
                 if (!tab) throw new Error(`Unknown target: ${params.targetId}`);
                 return { targetInfo: this.targetInfo(tab) };
             }

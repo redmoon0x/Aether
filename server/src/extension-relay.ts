@@ -84,9 +84,28 @@ interface ExtensionLink {
     pending: Map<number, PendingCall>;
     nextId: number;
     cdpConnections: Set<BrowserCdpConnection>;
+    /** Browser-level CDP sockets, closed if the link is finally dropped. */
+    cdpSockets: Set<WebSocket>;
 }
 
+/**
+ * How long a disconnected link stays in the map. Long enough for a suspended
+ * service worker to come back (its alarm runs every 30s) without orphaning the
+ * CDP sessions of every agent that is using it.
+ */
+const LINK_GRACE_MS = 10 * 60_000;
+
 const EXTENSION_CALL_TIMEOUT_MS = 30_000;
+/**
+ * How often the relay pings each extension link.
+ *
+ * An MV3 service worker is suspended after ~30s without activity, and Chrome
+ * does not close the WebSocket when that happens: the relay sees a healthy
+ * socket that never answers. A ping every 20s keeps the worker awake and turns
+ * a wedged link into a detected one, so the extension's alarm can reconnect.
+ */
+const HEARTBEAT_MS = 20_000;
+const HEARTBEAT_TIMEOUT_MS = 8_000;
 
 export function defaultRelayPort(): number {
     return Number(process.env.AETHER_EXTENSION_PORT || 8766);
@@ -125,6 +144,7 @@ export class ExtensionRelay {
     private readonly links = new Map<string, ExtensionLink>();
     private readonly clientsByTarget = new Map<string, WebSocket>();
     private readonly detachTimers = new Map<string, NodeJS.Timeout>();
+    private readonly linkTimers = new Map<string, NodeJS.Timeout>();
     private token: string;
     private pairingCode: string | null = null;
     private pairingExpiresAt = 0;
@@ -134,6 +154,7 @@ export class ExtensionRelay {
     private readonly port: number;
     private readonly onLent?: RelayOptions["onLent"];
     private linkCounter = 0;
+    private heartbeat: NodeJS.Timeout | null = null;
 
     constructor(options: RelayOptions = {}) {
         this.port = options.port ?? defaultRelayPort();
@@ -282,14 +303,21 @@ export class ExtensionRelay {
         }
 
         log.info(`relay listening on 127.0.0.1:${this.port}`);
+        this.startHeartbeat();
         return { started: true, port: this.port, token: this.token };
     }
 
     async stop(): Promise<void> {
+        if (this.heartbeat) {
+            clearInterval(this.heartbeat);
+            this.heartbeat = null;
+        }
         for (const socket of this.unpaired) socket.close(1000, "relay shutting down");
         this.unpaired.clear();
         for (const timer of this.detachTimers.values()) clearTimeout(timer);
         this.detachTimers.clear();
+        for (const timer of this.linkTimers.values()) clearTimeout(timer);
+        this.linkTimers.clear();
         for (const link of this.links.values()) {
             for (const pending of link.pending.values()) {
                 clearTimeout(pending.timer);
@@ -452,20 +480,43 @@ export class ExtensionRelay {
     private attachExtension(ws: WebSocket, browserId: string, name: string): void {
         const id = browserId || `browser-${++this.linkCounter}`;
         const existing = this.links.get(id);
-        if (existing && existing.ws !== ws) existing.ws.close(1000, "superseded");
+        // A service worker restart dials in again with the same browser id.
+        // Reuse the link so every browser-level CDP connection that captured
+        // it — Playwright's, in this or another MCP process — keeps working,
+        // and the tabs agents already own stay owned.
+        const link: ExtensionLink =
+            existing ?? {
+                id,
+                name: name || id,
+                ws,
+                tabs: new Map(),
+                owned: new Map(),
+                pending: new Map(),
+                nextId: 1,
+                cdpConnections: new Set(),
+                cdpSockets: new Set(),
+            };
 
-        const link: ExtensionLink = {
-            id,
-            name: name || id,
-            ws,
-            tabs: new Map(),
-            owned: new Map(),
-            pending: new Map(),
-            nextId: 1,
-            cdpConnections: new Set(),
-        };
-        this.links.set(id, link);
-        log.info("extension connected", { browserId: id, name: link.name });
+        if (existing) {
+            const previous = existing.ws;
+            const grace = this.linkTimers.get(id);
+            if (grace) {
+                clearTimeout(grace);
+                this.linkTimers.delete(id);
+            }
+            if (name) link.name = name;
+            for (const pending of link.pending.values()) {
+                clearTimeout(pending.timer);
+                pending.reject(new Error("The Aether extension reconnected before answering."));
+            }
+            link.pending.clear();
+            link.ws = ws;
+            if (previous && previous !== ws) previous.close(1000, "superseded");
+            log.info("extension reconnected", { browserId: id, name: link.name, tabs: link.owned.size });
+        } else {
+            this.links.set(id, link);
+            log.info("extension connected", { browserId: id, name: link.name });
+        }
 
         ws.on("message", (data) => {
             let message: ExtensionMessage;
@@ -477,15 +528,53 @@ export class ExtensionRelay {
             this.onExtensionMessage(link, message);
         });
         ws.on("close", () => {
-            if (this.links.get(id) === link) this.links.delete(id);
+            // A superseded socket closing is not the link going away.
+            if (link.ws !== ws) return;
             for (const pending of link.pending.values()) {
                 clearTimeout(pending.timer);
                 pending.reject(new Error("The Aether extension disconnected."));
             }
             link.pending.clear();
-            log.warn("extension disconnected", { browserId: id });
+            log.warn("extension disconnected", { browserId: id, tabs: link.owned.size });
+            // Keep the link, the tabs it owns and every CDP session bound to it.
+            // A service-worker restart reconnects within ~30s; dropping the link
+            // here used to orphan every agent using this browser.
+            const timer = setTimeout(() => {
+                this.linkTimers.delete(id);
+                if (this.links.get(id) !== link || link.ws.readyState === WebSocket.OPEN) return;
+                this.links.delete(id);
+                for (const socket of link.cdpSockets) socket.close(1011, "the browser link expired");
+                link.cdpSockets.clear();
+                log.info("dropping a browser link that did not come back", { browserId: id });
+            }, LINK_GRACE_MS);
+            timer.unref?.();
+            this.linkTimers.set(id, timer);
         });
         ws.on("error", () => ws.close());
+    }
+
+    /** Ping every live link; drop the ones that stop answering. */
+    private startHeartbeat(): void {
+        if (this.heartbeat) return;
+        this.heartbeat = setInterval(() => void this.beat(), HEARTBEAT_MS);
+        this.heartbeat.unref?.();
+    }
+
+    private async beat(): Promise<void> {
+        await Promise.all(
+            [...this.links.values()].map(async (link) => {
+                if (link.ws.readyState !== WebSocket.OPEN) return;
+                try {
+                    await this.callExtension(link, "ping", {}, HEARTBEAT_TIMEOUT_MS);
+                } catch (error) {
+                    log.warn("extension link missed a heartbeat; closing it", {
+                        browserId: link.id,
+                        error: error instanceof Error ? error.message : String(error),
+                    });
+                    link.ws.close(1011, "heartbeat failed");
+                }
+            })
+        );
     }
 
     private onExtensionMessage(link: ExtensionLink, message: ExtensionMessage): void {
@@ -642,8 +731,12 @@ export class ExtensionRelay {
             sessionId,
         })) as RelayTab;
         const tabId = Number(created.tabId);
+        const tab: RelayTab = { ...created, tabId };
         link.owned.set(tabId, { sessionId });
-        link.tabs.set(tabId, { ...created, tabId });
+        link.tabs.set(tabId, tab);
+        // A connection may already be live (another MCP process asked for this
+        // tab over HTTP); it has to learn about the tab it must drive.
+        for (const cdp of link.cdpConnections) void cdp.onTabCreated(tab);
         return tabId;
     }
 
@@ -654,6 +747,53 @@ export class ExtensionRelay {
         await this.refreshTabs(link);
         const tabId = await this.ensureAgentTab(link, sessionId);
         return { browserId: link.id, tabId };
+    }
+
+    /**
+     * Ensure an agent tab whichever process owns the extension link.
+     *
+     * Every MCP client spawns its own server, and only the first one binds the
+     * relay port. The others have no link to call, so they ask the owner over
+     * HTTP — the same endpoint a restarted server uses.
+     */
+    async ensureAgentTabAnywhere(
+        browserId: string | undefined,
+        sessionId: string
+    ): Promise<{ browserId: string; tabId: number } | null> {
+        if (this.running && this.resolveLink(browserId)) {
+            return await this.ensureAgentTabFor(browserId, sessionId);
+        }
+        const url = new URL(`http://127.0.0.1:${this.port}/agent-tab`);
+        url.searchParams.set("token", this.token || relayToken());
+        url.searchParams.set("session", sessionId);
+        if (browserId) url.searchParams.set("browser", browserId);
+        try {
+            const response = await fetch(url);
+            if (!response.ok) return null;
+            const body: unknown = await response.json();
+            if (!body || typeof body !== "object") return null;
+            const tabId = "tabId" in body ? Number(body.tabId) : Number.NaN;
+            if (!Number.isFinite(tabId)) return null;
+            const answered = "browserId" in body && typeof body.browserId === "string" ? body.browserId : "";
+            return { browserId: answered || String(browserId ?? ""), tabId };
+        } catch {
+            return null;
+        }
+    }
+
+    /**
+     * Run a tab command, re-attaching first when the extension lost its
+     * debugger attachment (a service-worker restart can drop it).
+     */
+    private async sendTab(link: ExtensionLink, tabId: number, method: string, params: unknown): Promise<unknown> {
+        try {
+            return await this.callExtension(link, "debugger.command", { tabId, method, params });
+        } catch (error) {
+            const message = error instanceof Error ? error.message : String(error);
+            if (!/not attached/i.test(message)) throw error;
+            await this.callExtension(link, "debugger.attach", { tabId });
+            return await this.callExtension(link, "debugger.command", { tabId, method, params });
+        }
     }
 
     private async attachTab(link: ExtensionLink, tabId: number): Promise<void> {
@@ -699,7 +839,7 @@ export class ExtensionRelay {
             group: (tabId, sessionId) => this.callExtension(link, "tabs.group", { tabId, sessionId }).then(() => undefined),
             send: async (tabId, method, params) => {
                 assertCdpAllowed(method);
-                return await this.callExtension(link, "debugger.command", { tabId, method, params });
+                return await this.sendTab(link, tabId, method, params);
             },
             isOwned: (tabId) => link.owned.has(tabId),
         };
@@ -710,6 +850,7 @@ export class ExtensionRelay {
             },
         });
         link.cdpConnections.add(connection);
+        link.cdpSockets.add(ws);
 
         ws.on("message", (data) => {
             let message: any;
@@ -736,7 +877,10 @@ export class ExtensionRelay {
                 }
             })();
         });
-        ws.on("close", () => link.cdpConnections.delete(connection));
+        ws.on("close", () => {
+            link.cdpConnections.delete(connection);
+            link.cdpSockets.delete(ws);
+        });
         ws.on("error", () => ws.close());
     }
 
@@ -827,11 +971,7 @@ export class ExtensionRelay {
                 ws.send(JSON.stringify({ id: message.id, result: local }));
                 return;
             }
-            const result = await this.callExtension(link, "debugger.command", {
-                tabId,
-                method: message.method,
-                params: message.params,
-            });
+            const result = await this.sendTab(link, tabId, message.method, message.params);
             if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify({ id: message.id, result: result ?? {} }));
         } catch (error: any) {
             if (ws.readyState !== WebSocket.OPEN) return;

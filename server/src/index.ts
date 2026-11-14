@@ -46,11 +46,18 @@ process.on("exit", () => {
 });
 
 // ── Create MCP Server (shared by both transports) ─────────────────────
+/** The published version, so clients see the build they are actually talking to. */
+function packageVersion(): string {
+    const pkg: unknown = require("../package.json");
+    if (pkg && typeof pkg === "object" && "version" in pkg && typeof pkg.version === "string") return pkg.version;
+    return "0.0.0";
+}
+
 function createMcpServer(): Server {
     const server = new Server(
         {
             name: "aether-mcp-server",
-            version: "3.0.0",
+            version: packageVersion(),
         },
         {
             capabilities: {

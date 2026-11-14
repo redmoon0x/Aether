@@ -7,6 +7,7 @@
  * agent has its own current session, so one agent's `session_new` does not
  * move another's page. Clients that do not name agents share one.
  */
+import * as crypto from "crypto";
 import * as fs from "fs/promises";
 import * as os from "os";
 import * as path from "path";
@@ -138,6 +139,18 @@ export class SessionManager {
     currentId(caller: string = "shared"): string {
         const id = this.currentByCaller.get(caller);
         if (id && this.get(id)) return id;
+        if (caller !== "shared") {
+            // A named agent gets its own default session. Falling back to the
+            // first stored session made two agents that never called
+            // sessions {action:"new"} share one tab.
+            const owned = `agent-${crypto.createHash("sha1").update(caller).digest("hex").slice(0, 8)}`;
+            if (!this.get(owned)) {
+                this.sessions.push(this.makeRecord(owned, `Agent ${caller.replace(/^mcp-/, "").slice(0, 32)}`));
+                void this.persist();
+            }
+            this.currentByCaller.set(caller, owned);
+            return owned;
+        }
         const fallback = this.sessions[0]?.id ?? "default";
         this.currentByCaller.set(caller, fallback);
         return fallback;

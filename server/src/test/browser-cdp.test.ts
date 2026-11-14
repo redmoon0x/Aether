@@ -95,3 +95,22 @@ test("only owned targets can be closed", async () => {
         /only close tabs it opened/i
     );
 });
+
+test("getTargetInfo without a targetId answers for the browser, even with no tabs", async () => {
+    const host = makeHost([]);
+    const connection = new BrowserCdpConnection("chrome-1", host, { send: () => undefined });
+
+    const result: any = await connection.handle({ id: 1, method: "Target.getTargetInfo", params: {} });
+    assert.equal(result.targetInfo.type, "browser");
+    assert.equal(result.targetInfo.targetId, "chrome-1");
+});
+
+test("attached target info carries the browser context Playwright requires", async () => {
+    const tabs: CdpTab[] = [{ tabId: 3, url: "https://example.com", title: "Example", active: true }];
+    const events: any[] = [];
+    const connection = new BrowserCdpConnection("chrome-1", makeHost(tabs), { send: (message) => events.push(message) });
+
+    await connection.handle({ id: 1, method: "Target.attachToTarget", params: { targetId: "chrome-1:3", flatten: true } });
+    const attached = events.find((event) => event.method === "Target.attachedToTarget");
+    assert.equal(attached.params.targetInfo.browserContextId, "aether-chrome-1");
+});

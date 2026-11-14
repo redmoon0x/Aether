@@ -95,13 +95,27 @@ async function resolveHost(
     const driver = getDriver();
     const sessionId = requestedSession || sessions.currentId(caller);
     const record = sessions.get(sessionId);
-    const pin = record?.target ?? {};
+    let pin = record?.target ?? {};
+
+    // An unpinned session asks the relay for *its* tab before adopting
+    // anything. The relay keys tabs by session id, so two agents never end up
+    // driving the same page — including across separate MCP processes.
+    if (!pin.targetId && !pin.urlIncludes && !pin.title) {
+        const browserId = pin.browserId ?? (await driver.defaultBrowserId()) ?? undefined;
+        if (browserId) {
+            const relayTab = await getExtensionRelay().ensureAgentTabAnywhere(browserId, sessionId).catch(() => null);
+            if (relayTab) {
+                pin = { browserId: relayTab.browserId, targetId: `${relayTab.browserId}:${relayTab.tabId}` };
+                await sessions.bind(sessionId, pin, caller);
+            }
+        }
+    }
 
     let resolved = await driver.getPage({ id: sessionId, ...pin });
     if (!resolved) {
         const browserId = pin.browserId ?? (await driver.defaultBrowserId()) ?? undefined;
         if (browserId) {
-            const relayTab = await getExtensionRelay().ensureAgentTabFor(browserId, sessionId).catch(() => null);
+            const relayTab = await getExtensionRelay().ensureAgentTabAnywhere(browserId, sessionId).catch(() => null);
             if (relayTab) {
                 await sessions.bind(
                     sessionId,
@@ -676,7 +690,7 @@ export function RegisterMcpTools(server: Server) {
                 const record = await sessions.create(String(a?.name ?? "session"), caller);
                 const browserId = (a?.browser as string | undefined) ?? (await driver.defaultBrowserId()) ?? undefined;
                 if (browserId) {
-                    const relayTab = await getExtensionRelay().ensureAgentTabFor(browserId, record.id).catch(() => null);
+                    const relayTab = await getExtensionRelay().ensureAgentTabAnywhere(browserId, record.id).catch(() => null);
                     if (relayTab) {
                         await sessions.bind(record.id, { browserId: relayTab.browserId, targetId: `${relayTab.browserId}:${relayTab.tabId}` }, caller);
                     } else {
@@ -861,7 +875,7 @@ export function RegisterMcpTools(server: Server) {
                 const browserId = (a?.browser as string | undefined) || status.browsers.find((browser: any) => browser.connected)?.id || status.browsers[0]?.id;
                 if (!browserId) throw new Error("The extension is connected but reported no browser id.");
 
-                let relayTab = await relay.ensureAgentTabFor(browserId, sessionArg ?? "agent").catch(() => null);
+                let relayTab = await relay.ensureAgentTabAnywhere(browserId, sessionArg ?? sessions.currentId(caller)).catch(() => null);
                 await driver.connectBrowser(browserId);
                 // A second MCP process does not own the extension link; it asks
                 // the relay's browser endpoint to create a page instead.
